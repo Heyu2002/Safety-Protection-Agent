@@ -66,7 +66,11 @@ impl LlmClient for AnthropicClient {
             .await?;
 
         if !response.status().is_success() {
-            return Err(LlmError::Provider(response.text().await?));
+            let status = response.status().as_u16();
+            return Err(LlmError::Provider {
+                status,
+                body: response.text().await?,
+            });
         }
 
         let output: AnthropicResponse = response.json().await?;

@@ -73,7 +73,11 @@ impl LlmClient for GeminiClient {
         let response = self.http.post(url).json(&body).send().await?;
 
         if !response.status().is_success() {
-            return Err(LlmError::Provider(response.text().await?));
+            let status = response.status().as_u16();
+            return Err(LlmError::Provider {
+                status,
+                body: response.text().await?,
+            });
         }
 
         let output: GeminiResponse = response.json().await?;

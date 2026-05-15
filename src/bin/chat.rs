@@ -1,5 +1,5 @@
 use clap::Parser;
-use safety_protection_agent::llm::{ChatMessage, CompletionRequest, client_from_env};
+use safety_protection_agent::llm::{ChatMessage, CompletionRequest, LlmConfig, client_from_config};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -14,6 +14,9 @@ struct Args {
 
     #[arg(long)]
     max_tokens: Option<u32>,
+
+    #[arg(long)]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -21,7 +24,16 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let args = Args::parse();
-    let client = client_from_env()?;
+    let config = LlmConfig::from_env()?;
+    if args.debug {
+        eprintln!(
+            "provider={:?}, model={}, base_url={}",
+            config.provider,
+            config.model,
+            config.base_url.as_deref().unwrap_or("")
+        );
+    }
+    let client = client_from_config(config)?;
 
     let mut messages = Vec::new();
     if let Some(system) = args.system {

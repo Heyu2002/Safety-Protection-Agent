@@ -13,8 +13,8 @@ pub enum LlmError {
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    #[error("provider returned an error: {0}")]
-    Provider(String),
+    #[error("provider returned an error: status={status}, body={body}")]
+    Provider { status: u16, body: String },
 
     #[error("provider response did not contain text output")]
     EmptyResponse,

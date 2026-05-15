@@ -65,6 +65,17 @@ KIMI_BASE_URL=https://api.kimi.com/coding/v1
 For OpenAI-compatible providers, keep `LLM_PROVIDER=openai-compatible` and set
 `OPENAI_BASE_URL` to the provider endpoint.
 
+For a custom relay or proxy, use the same OpenAI-compatible adapter:
+
+```text
+LLM_PROVIDER=openai-compatible
+OPENAI_API_KEY=your-proxy-key
+OPENAI_MODEL=your-proxy-model
+OPENAI_BASE_URL=https://your-proxy.example.com/v1
+```
+
+The relay should expose `POST /v1/chat/completions`.
+
 Kimi Code / Kimi CLI subscriptions use the `api.kimi.com` account system:
 
 ```text
