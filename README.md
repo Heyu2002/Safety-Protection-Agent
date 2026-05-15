@@ -11,7 +11,8 @@ Supported providers:
 
 - `openai`: OpenAI Chat Completions API
 - `openai-compatible`: any OpenAI-compatible endpoint
-- `kimi`: Kimi / Moonshot API through its OpenAI-compatible endpoint
+- `kimi`: Kimi Code / Kimi CLI subscription API
+- `moonshot`: Moonshot / Kimi Platform API
 - `anthropic`: Anthropic Messages API
 - `gemini`: Google Gemini Generate Content API
 - `ollama`: local Ollama chat API
@@ -56,14 +57,28 @@ async fn main() -> safety_protection_agent::llm::Result<()> {
 
 ```text
 LLM_PROVIDER=kimi
-MOONSHOT_API_KEY=sk-...
-MOONSHOT_MODEL=kimi-k2.6
-MOONSHOT_BASE_URL=https://api.moonshot.cn/v1
+KIMI_API_KEY=sk-...
+KIMI_MODEL=kimi-for-coding
+KIMI_BASE_URL=https://api.kimi.com/coding/v1
 ```
 
 For OpenAI-compatible providers, keep `LLM_PROVIDER=openai-compatible` and set
 `OPENAI_BASE_URL` to the provider endpoint.
 
-Kimi's API is OpenAI-compatible, so the Rust implementation reuses the
-OpenAI-compatible provider internally while exposing clearer `MOONSHOT_*`
-environment variables.
+Kimi Code / Kimi CLI subscriptions use the `api.kimi.com` account system:
+
+```text
+LLM_PROVIDER=kimi
+KIMI_API_KEY=sk-...
+KIMI_MODEL=kimi-for-coding
+KIMI_BASE_URL=https://api.kimi.com/coding/v1
+```
+
+Moonshot / Kimi Platform API keys use a separate account system:
+
+```text
+LLM_PROVIDER=moonshot
+MOONSHOT_API_KEY=sk-...
+MOONSHOT_MODEL=kimi-k2.6
+MOONSHOT_BASE_URL=https://api.moonshot.cn/v1
+```

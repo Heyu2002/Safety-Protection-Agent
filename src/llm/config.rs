@@ -5,6 +5,7 @@ pub enum ProviderKind {
     OpenAi,
     OpenAiCompatible,
     Kimi,
+    Moonshot,
     Anthropic,
     Gemini,
     Ollama,
@@ -15,7 +16,8 @@ impl ProviderKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" => Ok(Self::OpenAi),
             "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
-            "kimi" | "moonshot" => Ok(Self::Kimi),
+            "kimi" | "kimi-code" | "kimi-cli" => Ok(Self::Kimi),
+            "moonshot" | "kimi-platform" => Ok(Self::Moonshot),
             "anthropic" | "claude" => Ok(Self::Anthropic),
             "gemini" | "google" => Ok(Self::Gemini),
             "ollama" | "local" => Ok(Self::Ollama),
@@ -49,6 +51,16 @@ impl LlmConfig {
                 model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_string()),
             }),
             ProviderKind::Kimi => Ok(Self {
+                provider,
+                api_key: Some(required_env("KIMI_API_KEY")?),
+                base_url: Some(
+                    std::env::var("KIMI_BASE_URL")
+                        .unwrap_or_else(|_| "https://api.kimi.com/coding/v1".to_string()),
+                ),
+                model: std::env::var("KIMI_MODEL")
+                    .unwrap_or_else(|_| "kimi-for-coding".to_string()),
+            }),
+            ProviderKind::Moonshot => Ok(Self {
                 provider,
                 api_key: Some(required_env("MOONSHOT_API_KEY")?),
                 base_url: Some(
