@@ -1,0 +1,25 @@
+[package]
+name = "safety-protection-agent"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "An agent capable of scanning for different disclosed vulnerabilities."
+
+[lib]
+name = "safety_protection_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spa-chat"
+path = "src/bin/chat.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+dotenvy = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
