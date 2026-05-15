@@ -4,6 +4,7 @@ use super::error::{LlmError, Result};
 pub enum ProviderKind {
     OpenAi,
     OpenAiCompatible,
+    OpenAiResponses,
     Kimi,
     Moonshot,
     Anthropic,
@@ -16,6 +17,7 @@ impl ProviderKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" => Ok(Self::OpenAi),
             "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
+            "openai-responses" | "responses" => Ok(Self::OpenAiResponses),
             "kimi" | "kimi-code" | "kimi-cli" => Ok(Self::Kimi),
             "moonshot" | "kimi-platform" => Ok(Self::Moonshot),
             "anthropic" | "claude" => Ok(Self::Anthropic),
@@ -41,7 +43,9 @@ impl LlmConfig {
         )?;
 
         match provider {
-            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => Ok(Self {
+            ProviderKind::OpenAi
+            | ProviderKind::OpenAiCompatible
+            | ProviderKind::OpenAiResponses => Ok(Self {
                 provider,
                 api_key: Some(required_env("OPENAI_API_KEY")?),
                 base_url: Some(

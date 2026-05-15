@@ -11,6 +11,7 @@ Supported providers:
 
 - `openai`: OpenAI Chat Completions API
 - `openai-compatible`: any OpenAI-compatible endpoint
+- `openai-responses`: OpenAI Responses API endpoint
 - `kimi`: Kimi Code / Kimi CLI subscription API
 - `moonshot`: Moonshot / Kimi Platform API
 - `anthropic`: Anthropic Messages API
@@ -75,6 +76,17 @@ OPENAI_BASE_URL=https://your-proxy.example.com/v1
 ```
 
 The relay should expose `POST /v1/chat/completions`.
+
+If your relay only supports OpenAI Responses API, use:
+
+```text
+LLM_PROVIDER=openai-responses
+OPENAI_API_KEY=your-proxy-key
+OPENAI_MODEL=your-proxy-model
+OPENAI_BASE_URL=https://your-proxy.example.com/v1
+```
+
+The relay should expose `POST /v1/responses`.
 
 Kimi Code / Kimi CLI subscriptions use the `api.kimi.com` account system:
 
