@@ -4,6 +4,7 @@ use super::error::{LlmError, Result};
 pub enum ProviderKind {
     OpenAi,
     OpenAiCompatible,
+    Kimi,
     Anthropic,
     Gemini,
     Ollama,
@@ -14,6 +15,7 @@ impl ProviderKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" => Ok(Self::OpenAi),
             "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
+            "kimi" | "moonshot" => Ok(Self::Kimi),
             "anthropic" | "claude" => Ok(Self::Anthropic),
             "gemini" | "google" => Ok(Self::Gemini),
             "ollama" | "local" => Ok(Self::Ollama),
@@ -45,6 +47,15 @@ impl LlmConfig {
                         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
                 ),
                 model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_string()),
+            }),
+            ProviderKind::Kimi => Ok(Self {
+                provider,
+                api_key: Some(required_env("MOONSHOT_API_KEY")?),
+                base_url: Some(
+                    std::env::var("MOONSHOT_BASE_URL")
+                        .unwrap_or_else(|_| "https://api.moonshot.cn/v1".to_string()),
+                ),
+                model: std::env::var("MOONSHOT_MODEL").unwrap_or_else(|_| "kimi-k2.6".to_string()),
             }),
             ProviderKind::Anthropic => Ok(Self {
                 provider,

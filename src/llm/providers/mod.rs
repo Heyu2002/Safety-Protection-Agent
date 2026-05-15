@@ -7,7 +7,7 @@ use super::{LlmClient, LlmConfig, ProviderKind, Result};
 
 pub fn client_from_config(config: LlmConfig) -> Result<Box<dyn LlmClient>> {
     match config.provider {
-        ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => Ok(Box::new(
+        ProviderKind::OpenAi | ProviderKind::OpenAiCompatible | ProviderKind::Kimi => Ok(Box::new(
             openai_compatible::OpenAiCompatibleClient::new(config),
         )),
         ProviderKind::Anthropic => Ok(Box::new(anthropic::AnthropicClient::new(config))),
