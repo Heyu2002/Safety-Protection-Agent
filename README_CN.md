@@ -64,8 +64,11 @@ cargo run --bin spa-chat -- --repl
 
 ## Agent 系统提示词
 
-默认的 Safety Protection Agent 系统提示词位于 `src/agent/prompt.rs`。
-它定义了 agent 的产品身份、防御安全定位、工作方式和安全边界。provider 层仍然保持通用，只负责调用模型 API。
+默认的 Safety Protection Agent 系统提示词位于 `src/agent/prompts/default.md`。
+压缩上下文使用的提示词位于 `src/agent/prompts/compact.md`。
+`src/agent/prompt.rs` 只负责通过 `include_str!` 把这些 Markdown 提示词暴露给 Rust 代码。
+
+系统提示词定义了 agent 的产品身份、防御安全定位、工作方式、上下文规则和安全边界。provider 层仍然保持通用，只负责调用模型 API。
 
 系统提示词不允许通过 CLI 参数或 `.env` 覆盖，因为它属于 agent 的安全边界。只有在产品行为需要正式变更时，才应该在代码里修改。
 

@@ -66,10 +66,14 @@ cargo run --bin spa-chat -- --repl
 
 ### Agent System Prompt
 
-The default Safety Protection Agent system prompt lives in `src/agent/prompt.rs`.
-It defines the agent's product identity, defensive security scope, operating
-style, and safety boundaries. Providers stay generic and only send requests to
-model APIs.
+The default Safety Protection Agent system prompt lives in
+`src/agent/prompts/default.md`. The compaction prompt lives in
+`src/agent/prompts/compact.md`. `src/agent/prompt.rs` only exposes these
+Markdown prompts to Rust with `include_str!`.
+
+The prompt defines the agent's product identity, defensive security scope,
+operating style, context rules, and safety boundaries. Providers stay generic
+and only send requests to model APIs.
 
 The system prompt is not configurable from CLI arguments or `.env`, because it
 is part of the agent's security boundary. Change it in code when the product
