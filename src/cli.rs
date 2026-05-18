@@ -5,21 +5,16 @@ use crossterm::queue;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType};
 use std::io::{IsTerminal, Write};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::agent::prompt::{
+    COMPACT_SYSTEM_PROMPT, COMPACTED_CONTEXT_PREFIX, default_system_prompt,
+};
 use crate::llm::{
     ChatMessage, ChatRole, CompletionRequest, LlmClient, LlmConfig, client_from_config,
 };
 
 const COMPACT_MAX_TOKENS: u32 = 1200;
-const COMPACT_SYSTEM_PROMPT: &str = r#"You compact an agent conversation history.
-Write a concise but faithful summary that preserves:
-- user goals, preferences, constraints, and decisions
-- active tasks and current state
-- important commands, file paths, configuration keys, errors, and fixes
-- unresolved questions or follow-up work
-
-Do not invent facts. Prefer dense, useful context over prose."#;
-const COMPACTED_CONTEXT_PREFIX: &str = "The conversation history before this point has been compacted. Use this summary as durable context:\n";
 
 struct SlashCommand {
     name: &'static str,
@@ -60,9 +55,6 @@ pub struct ChatCliArgs {
     prompt: Option<String>,
 
     #[arg(long)]
-    system: Option<String>,
-
-    #[arg(long)]
     temperature: Option<f32>,
 
     #[arg(long)]
@@ -90,11 +82,12 @@ pub async fn run_chat_cli(default_repl: bool) -> anyhow::Result<()> {
     }
     let client = client_from_config(config)?;
     let repl = args.repl || (default_repl && args.prompt.is_none());
+    let system = default_system_prompt().to_owned();
 
     if repl {
         run_repl(
             client.as_ref(),
-            args.system,
+            system,
             args.prompt,
             args.temperature,
             args.max_tokens,
@@ -106,7 +99,7 @@ pub async fn run_chat_cli(default_repl: bool) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--prompt is required unless --repl is set"))?;
         run_once(
             client.as_ref(),
-            args.system,
+            system,
             prompt,
             args.temperature,
             args.max_tokens,
@@ -119,15 +112,13 @@ pub async fn run_chat_cli(default_repl: bool) -> anyhow::Result<()> {
 
 async fn run_once(
     client: &dyn LlmClient,
-    system: Option<String>,
+    system: String,
     prompt: String,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
 ) -> anyhow::Result<()> {
     let mut messages = Vec::new();
-    if let Some(system) = system {
-        messages.push(ChatMessage::system(system));
-    }
+    messages.push(ChatMessage::system(system));
     messages.push(ChatMessage::user(prompt));
 
     let response = complete(client, &messages, temperature, max_tokens).await?;
@@ -138,15 +129,13 @@ async fn run_once(
 
 async fn run_repl(
     client: &dyn LlmClient,
-    system: Option<String>,
+    system: String,
     first_prompt: Option<String>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
 ) -> anyhow::Result<()> {
     let mut history = Vec::new();
-    if let Some(system) = system.as_ref() {
-        history.push(ChatMessage::system(system));
-    }
+    history.push(ChatMessage::system(&system));
 
     println!("Safety Protection Agent");
     println!("Interactive chat started. Commands: /help, /compact, /clear, /exit");
@@ -179,7 +168,7 @@ async fn run_repl(
             }
             "/compact" => {
                 let before = history.len();
-                if compact_history(client, &mut history, system.as_ref()).await? {
+                if compact_history(client, &mut history, &system).await? {
                     println!(
                         "Context compacted: {before} messages -> {} messages.",
                         history.len()
@@ -190,9 +179,7 @@ async fn run_repl(
             }
             "/clear" => {
                 history.clear();
-                if let Some(system) = system.as_ref() {
-                    history.push(ChatMessage::system(system));
-                }
+                history.push(ChatMessage::system(&system));
                 println!("History cleared.");
             }
             _ => {
@@ -458,7 +445,7 @@ fn render_editor(
 
     queue!(
         stdout,
-        cursor::MoveToColumn((prompt.chars().count() + cursor_index) as u16)
+        cursor::MoveToColumn(editor_cursor_column(prompt, buffer, cursor_index))
     )?;
     stdout.flush()?;
     Ok(())
@@ -466,6 +453,23 @@ fn render_editor(
 
 fn chars_to_string(chars: &[char]) -> String {
     chars.iter().collect()
+}
+
+fn editor_cursor_column(prompt: &str, buffer: &[char], cursor_index: usize) -> u16 {
+    let cursor_index = cursor_index.min(buffer.len());
+    let width = prompt.width() + chars_display_width(&buffer[..cursor_index]);
+    terminal_column(width)
+}
+
+fn chars_display_width(chars: &[char]) -> usize {
+    chars
+        .iter()
+        .map(|ch| UnicodeWidthChar::width(*ch).unwrap_or(0))
+        .sum()
+}
+
+fn terminal_column(width: usize) -> u16 {
+    width.min(u16::MAX as usize) as u16
 }
 
 fn slash_menu_items(line: &str) -> Vec<SlashCommandMatch> {
@@ -509,7 +513,7 @@ fn print_slash_commands() {
 async fn compact_history(
     client: &dyn LlmClient,
     history: &mut Vec<ChatMessage>,
-    system: Option<&String>,
+    system: &str,
 ) -> anyhow::Result<bool> {
     let messages = compactable_messages(history, system);
     let has_dialogue = messages
@@ -539,9 +543,7 @@ async fn compact_history(
     }
 
     history.clear();
-    if let Some(system) = system {
-        history.push(ChatMessage::system(system));
-    }
+    history.push(ChatMessage::system(system));
     history.push(ChatMessage::system(format!(
         "{COMPACTED_CONTEXT_PREFIX}{summary}"
     )));
@@ -549,15 +551,14 @@ async fn compact_history(
     Ok(true)
 }
 
-fn compactable_messages(history: &[ChatMessage], system: Option<&String>) -> Vec<ChatMessage> {
+fn compactable_messages(history: &[ChatMessage], system: &str) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     let mut skipped_original_system = false;
 
     for message in history {
         if !skipped_original_system
-            && let Some(system) = system
             && matches!(message.role, ChatRole::System)
-            && message.content == *system
+            && message.content == system
         {
             skipped_original_system = true;
             continue;
@@ -652,6 +653,7 @@ mod tests {
     use super::*;
     use crate::llm::{ChatUsage, CompletionResponse, Result};
     use async_trait::async_trait;
+    use clap::CommandFactory;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -685,7 +687,7 @@ mod tests {
             ChatMessage::assistant("I will implement it."),
         ];
 
-        let compacted = compact_history(&client, &mut history, Some(&system))
+        let compacted = compact_history(&client, &mut history, &system)
             .await
             .expect("compact should succeed");
 
@@ -715,7 +717,7 @@ mod tests {
         let system = "You are a security assistant.".to_string();
         let mut history = vec![ChatMessage::system(&system)];
 
-        let compacted = compact_history(&client, &mut history, Some(&system))
+        let compacted = compact_history(&client, &mut history, &system)
             .await
             .expect("empty compact should succeed");
 
@@ -758,5 +760,33 @@ mod tests {
             &mut unknown,
             &mut unknown_cursor
         ));
+    }
+
+    #[test]
+    fn editor_cursor_column_uses_unicode_display_width() {
+        let buffer: Vec<char> = "你好".chars().collect();
+
+        assert_eq!(editor_cursor_column("spa> ", &buffer, 0), 5);
+        assert_eq!(editor_cursor_column("spa> ", &buffer, 1), 7);
+        assert_eq!(editor_cursor_column("spa> ", &buffer, 2), 9);
+    }
+
+    #[test]
+    fn editor_cursor_column_keeps_ascii_width() {
+        let buffer: Vec<char> = "hello".chars().collect();
+
+        assert_eq!(editor_cursor_column("spa> ", &buffer, 0), 5);
+        assert_eq!(editor_cursor_column("spa> ", &buffer, 5), 10);
+    }
+
+    #[test]
+    fn cli_does_not_expose_system_prompt_override() {
+        let mut help = Vec::new();
+        ChatCliArgs::command()
+            .write_long_help(&mut help)
+            .expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+
+        assert!(!help.contains("--system"));
     }
 }

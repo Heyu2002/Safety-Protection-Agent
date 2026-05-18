@@ -64,6 +64,17 @@ The lower-level `spa-chat` binary is still available:
 cargo run --bin spa-chat -- --repl
 ```
 
+### Agent System Prompt
+
+The default Safety Protection Agent system prompt lives in `src/agent/prompt.rs`.
+It defines the agent's product identity, defensive security scope, operating
+style, and safety boundaries. Providers stay generic and only send requests to
+model APIs.
+
+The system prompt is not configurable from CLI arguments or `.env`, because it
+is part of the agent's security boundary. Change it in code when the product
+behavior intentionally changes.
+
 ### Library Usage
 
 ```rust
