@@ -72,6 +72,16 @@ cargo run --bin spa-chat -- --repl
 
 系统提示词不允许通过 CLI 参数或 `.env` 覆盖，因为它属于 agent 的安全边界。只有在产品行为需要正式变更时，才应该在代码里修改。
 
+## Skills
+
+Codex 风格的 skill 骨架位于 `skills/`。通用约定在 `skills/CONVENTIONS.md`，模板位于 `skills/templates/`。
+
+创建新的 skill 骨架：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\new-skill.ps1 -Name skill-name -Description "Use when ..."
+```
+
 如果需要查看实际 provider、模型和 base URL：
 
 ```powershell

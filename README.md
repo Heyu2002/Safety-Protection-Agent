@@ -79,6 +79,17 @@ The system prompt is not configurable from CLI arguments or `.env`, because it
 is part of the agent's security boundary. Change it in code when the product
 behavior intentionally changes.
 
+### Skills
+
+Codex-style skill scaffolding lives under `skills/`. Shared conventions are in
+`skills/CONVENTIONS.md`, and reusable templates live in `skills/templates/`.
+
+Create a new skill scaffold with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\new-skill.ps1 -Name skill-name -Description "Use when ..."
+```
+
 ### Library Usage
 
 ```rust
