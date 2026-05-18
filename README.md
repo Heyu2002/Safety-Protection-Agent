@@ -12,6 +12,7 @@ Supported providers:
 - `openai`: OpenAI Chat Completions API
 - `openai-compatible`: any OpenAI-compatible endpoint
 - `openai-responses`: OpenAI Responses API endpoint
+- `codex-chatgpt`: local Codex ChatGPT login through `~/.codex/auth.json`
 - `kimi`: Kimi Code / Kimi CLI subscription API
 - `moonshot`: Moonshot / Kimi Platform API
 - `anthropic`: Anthropic Messages API
@@ -87,6 +88,18 @@ OPENAI_BASE_URL=https://your-proxy.example.com/v1
 ```
 
 The relay should expose `POST /v1/responses`.
+
+To reuse a local Codex ChatGPT login, use:
+
+```text
+LLM_PROVIDER=codex-chatgpt
+CODEX_MODEL=gpt-5.5
+CODEX_CHATGPT_BASE_URL=https://chatgpt.com/backend-api/codex
+```
+
+This reads `~/.codex/auth.json` and calls `POST /responses` on the Codex
+ChatGPT backend. It requires your shell network environment to reach
+`chatgpt.com`.
 
 Kimi Code / Kimi CLI subscriptions use the `api.kimi.com` account system:
 

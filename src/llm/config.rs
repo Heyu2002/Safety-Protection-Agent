@@ -5,6 +5,7 @@ pub enum ProviderKind {
     OpenAi,
     OpenAiCompatible,
     OpenAiResponses,
+    CodexChatGpt,
     Kimi,
     Moonshot,
     Anthropic,
@@ -18,6 +19,7 @@ impl ProviderKind {
             "openai" => Ok(Self::OpenAi),
             "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
             "openai-responses" | "responses" => Ok(Self::OpenAiResponses),
+            "codex-chatgpt" | "codex" | "chatgpt" => Ok(Self::CodexChatGpt),
             "kimi" | "kimi-code" | "kimi-cli" => Ok(Self::Kimi),
             "moonshot" | "kimi-platform" => Ok(Self::Moonshot),
             "anthropic" | "claude" => Ok(Self::Anthropic),
@@ -53,6 +55,15 @@ impl LlmConfig {
                         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
                 ),
                 model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_string()),
+            }),
+            ProviderKind::CodexChatGpt => Ok(Self {
+                provider,
+                api_key: None,
+                base_url: Some(
+                    std::env::var("CODEX_CHATGPT_BASE_URL")
+                        .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".to_string()),
+                ),
+                model: std::env::var("CODEX_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string()),
             }),
             ProviderKind::Kimi => Ok(Self {
                 provider,
