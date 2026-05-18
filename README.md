@@ -1,5 +1,7 @@
 # Safety-Protection-Agent
 
+[中文文档](README_CN.md)
+
 An agent capable of scanning for different disclosed vulnerabilities.
 
 ## LLM API Adapter
