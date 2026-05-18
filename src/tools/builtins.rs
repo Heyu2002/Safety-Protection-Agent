@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{Result, ToolCall, ToolError, ToolHandler, ToolOutput, ToolSpec};
+use super::{HttpLoadTestTool, Result, ToolCall, ToolError, ToolHandler, ToolOutput, ToolSpec};
 
 pub fn built_in_tools() -> Vec<Box<dyn ToolHandler>> {
-    vec![Box::new(EchoTool)]
+    vec![Box::new(EchoTool), Box::new(HttpLoadTestTool)]
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -5,6 +5,7 @@ use crossterm::queue;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType};
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::prompt::{
@@ -13,6 +14,9 @@ use crate::agent::prompt::{
 use crate::llm::{
     ChatMessage, ChatRole, CompletionRequest, LlmClient, LlmConfig, client_from_config,
 };
+use crate::tools::{ToolCall, ToolRegistry};
+
+use serde_json::json;
 
 const COMPACT_MAX_TOKENS: u32 = 1200;
 
@@ -594,11 +598,239 @@ async fn submit_repl_turn(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
 ) -> anyhow::Result<()> {
+    if let Some(turn) = maybe_run_local_tool(&prompt, history).await? {
+        match turn {
+            LocalToolTurn::Clarify { url, reason } => {
+                let response = clarify_local_tool_request(client, &url, reason).await?;
+                println!("{response}");
+                history.push(ChatMessage::user(prompt));
+                history.push(ChatMessage::assistant(response));
+            }
+            LocalToolTurn::ToolResult {
+                content,
+                metadata,
+                tool_name,
+            } => {
+                println!("{content}");
+                println!("Analyzing tool result with AI...");
+                let analysis = analyze_tool_result(client, tool_name, &metadata).await?;
+                let response = format_tool_output(&content, &metadata, &analysis);
+                println!("\n{analysis}");
+                history.push(ChatMessage::user(prompt));
+                history.push(ChatMessage::assistant(response));
+            }
+        }
+        return Ok(());
+    }
+
     history.push(ChatMessage::user(prompt));
     let response = complete(client, history, temperature, max_tokens).await?;
     println!("{response}");
     history.push(ChatMessage::assistant(response));
     Ok(())
+}
+
+enum LocalToolTurn {
+    Clarify {
+        url: String,
+        reason: &'static str,
+    },
+    ToolResult {
+        content: String,
+        metadata: serde_json::Value,
+        tool_name: &'static str,
+    },
+}
+
+async fn maybe_run_local_tool(
+    prompt: &str,
+    history: &[ChatMessage],
+) -> anyhow::Result<Option<LocalToolTurn>> {
+    if !looks_like_load_test_request(prompt, history) {
+        return Ok(None);
+    }
+
+    let Some(url) = extract_first_http_url(prompt).or_else(|| latest_http_url(history)) else {
+        return Ok(None);
+    };
+
+    let Some(method) = extract_http_method(prompt) else {
+        return Ok(Some(LocalToolTurn::Clarify {
+            url,
+            reason: "missing HTTP method and request input details",
+        }));
+    };
+
+    println!("Running tool: http_load_test ({method} {url})");
+    let registry = ToolRegistry::with_builtins()?;
+    let duration_secs = 60;
+    let call = ToolCall::new(
+        "http_load_test",
+        json!({
+            "url": url,
+            "method": method,
+            "duration_secs": duration_secs,
+            "requests_per_minute": 600,
+            "concurrency": 32,
+            "timeout_ms": 10000
+        }),
+    );
+    let output = dispatch_with_progress(registry, call).await?;
+    let metadata = output.metadata.unwrap_or_else(|| json!({}));
+
+    Ok(Some(LocalToolTurn::ToolResult {
+        content: output.content,
+        metadata,
+        tool_name: "http_load_test",
+    }))
+}
+
+async fn dispatch_with_progress(
+    registry: ToolRegistry,
+    call: ToolCall,
+) -> anyhow::Result<crate::tools::ToolOutput> {
+    let progress = Arc::new(|progress: crate::tools::ToolProgress| {
+        println!(
+            "Tool progress: {} {}% - {}",
+            progress.tool_name, progress.percent, progress.message
+        );
+    });
+
+    registry
+        .dispatch_with_progress(call, progress)
+        .await
+        .map_err(Into::into)
+}
+
+async fn analyze_tool_result(
+    client: &dyn LlmClient,
+    tool_name: &str,
+    metadata: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let prompt = format!(
+        "Analyze this {tool_name} result in Chinese for a developer. Explain what the metrics mean, whether the endpoint looks healthy, any latency or error risks, and concrete next steps. Do not repeat the full JSON.\n\n```json\n{}\n```",
+        pretty_json(metadata)
+    );
+
+    complete(
+        client,
+        &[
+            ChatMessage::system(
+                "You analyze local tool results for a defensive security and reliability agent.",
+            ),
+            ChatMessage::user(prompt),
+        ],
+        Some(0.2),
+        Some(800),
+    )
+    .await
+}
+
+async fn clarify_local_tool_request(
+    client: &dyn LlmClient,
+    url: &str,
+    reason: &str,
+) -> anyhow::Result<String> {
+    let prompt = format!(
+        "The user wants to run an HTTP load test, but the tool must not run yet.\nURL: {url}\nMissing information: {reason}\n\nAsk the user in Chinese to confirm the HTTP method and whether the request needs a body, headers, or token. Be concise. Do not use Markdown code fences. Do not claim that the load test has started."
+    );
+
+    complete(
+        client,
+        &[
+            ChatMessage::system("You ask concise clarification questions before local tool calls."),
+            ChatMessage::user(prompt),
+        ],
+        Some(0.2),
+        Some(300),
+    )
+    .await
+}
+
+fn looks_like_load_test_request(prompt: &str, history: &[ChatMessage]) -> bool {
+    let prompt_lower = prompt.to_ascii_lowercase();
+    prompt.contains("\u{538b}\u{6d4b}")
+        || prompt_lower.contains("load test")
+        || prompt_lower.contains("stress test")
+        || (mentions_http_method(prompt) && previous_user_asked_for_load_test(history))
+}
+
+fn previous_user_asked_for_load_test(history: &[ChatMessage]) -> bool {
+    history.iter().rev().take(4).any(|message| {
+        matches!(message.role, ChatRole::User)
+            && (message.content.contains("\u{538b}\u{6d4b}")
+                || message.content.to_ascii_lowercase().contains("load test")
+                || message.content.to_ascii_lowercase().contains("stress test"))
+    })
+}
+
+fn mentions_http_method(prompt: &str) -> bool {
+    extract_http_method(prompt).is_some()
+}
+
+fn extract_http_method(prompt: &str) -> Option<&'static str> {
+    let lower = prompt.to_ascii_lowercase();
+    for (needle, method) in [
+        ("options", "OPTIONS"),
+        ("delete", "DELETE"),
+        ("patch", "PATCH"),
+        ("post", "POST"),
+        ("head", "HEAD"),
+        ("put", "PUT"),
+        ("get", "GET"),
+    ] {
+        if lower.contains(needle) {
+            return Some(method);
+        }
+    }
+
+    None
+}
+
+fn latest_http_url(history: &[ChatMessage]) -> Option<String> {
+    history
+        .iter()
+        .rev()
+        .find_map(|message| extract_first_http_url(&message.content))
+}
+
+fn extract_first_http_url(text: &str) -> Option<String> {
+    let start = text.find("http://").or_else(|| text.find("https://"))?;
+    let rest = &text[start..];
+    let end = rest
+        .char_indices()
+        .find_map(|(index, ch)| {
+            if index == 0 {
+                return None;
+            }
+            if ch.is_whitespace() || is_url_trailing_boundary(ch) {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(rest.len());
+
+    Some(rest[..end].to_owned())
+}
+
+fn is_url_trailing_boundary(ch: char) -> bool {
+    !ch.is_ascii()
+        || matches!(
+            ch,
+            '`' | ',' | '.' | ';' | ')' | ']' | '}' | '"' | '\'' | '<' | '>'
+        )
+}
+
+fn format_tool_output(content: &str, metadata: &serde_json::Value, analysis: &str) -> String {
+    format!(
+        "{content}\n\nAI analysis:\n{analysis}\n\nTool metadata:\n```json\n{}\n```",
+        pretty_json(metadata)
+    )
+}
+
+fn pretty_json(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 async fn complete(
@@ -764,7 +996,7 @@ mod tests {
 
     #[test]
     fn editor_cursor_column_uses_unicode_display_width() {
-        let buffer: Vec<char> = "你好".chars().collect();
+        let buffer: Vec<char> = "\u{4f60}\u{597d}".chars().collect();
 
         assert_eq!(editor_cursor_column("spa> ", &buffer, 0), 5);
         assert_eq!(editor_cursor_column("spa> ", &buffer, 1), 7);
@@ -788,5 +1020,61 @@ mod tests {
         let help = String::from_utf8(help).expect("help should be utf8");
 
         assert!(!help.contains("--system"));
+    }
+
+    #[test]
+    fn extracts_url_embedded_in_chinese_text() {
+        assert_eq!(
+            extract_first_http_url(
+                "\u{5e2e}\u{6211}\u{538b}\u{6d4b}http://localhost:5173/api/v2/operation/test\u{8fd9}\u{4e2a}"
+            ),
+            Some("http://localhost:5173/api/v2/operation/test".to_owned())
+        );
+    }
+
+    #[test]
+    fn extracts_url_before_trailing_backtick() {
+        assert_eq!(
+            extract_first_http_url("`http://localhost:5173/api/v2/operation/test`"),
+            Some("http://localhost:5173/api/v2/operation/test".to_owned())
+        );
+    }
+
+    #[test]
+    fn routes_followup_get_to_previous_load_test_url() {
+        let history = vec![ChatMessage::user(
+            "\u{5e2e}\u{6211}\u{538b}\u{6d4b} http://localhost:5173/api/v2/operation/test",
+        )];
+
+        assert!(looks_like_load_test_request(
+            "this endpoint is get",
+            &history
+        ));
+        assert_eq!(
+            latest_http_url(&history),
+            Some("http://localhost:5173/api/v2/operation/test".to_owned())
+        );
+    }
+
+    #[test]
+    fn asks_for_method_before_running_load_test() {
+        let history = Vec::new();
+
+        assert!(looks_like_load_test_request(
+            "\u{5e2e}\u{6211}\u{538b}\u{6d4b} http://localhost:5173/api/v2/operation/test",
+            &history
+        ));
+        assert_eq!(
+            extract_http_method(
+                "\u{5e2e}\u{6211}\u{538b}\u{6d4b} http://localhost:5173/api/v2/operation/test"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn extracts_explicit_http_method() {
+        assert_eq!(extract_http_method("this endpoint is get"), Some("GET"));
+        assert_eq!(extract_http_method("POST body is {}"), Some("POST"));
     }
 }

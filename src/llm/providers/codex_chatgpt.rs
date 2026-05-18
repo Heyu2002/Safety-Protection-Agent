@@ -42,7 +42,7 @@ impl LlmClient for CodexChatGptClient {
                     "type": "message",
                     "role": role,
                     "content": [{
-                        "type": "input_text",
+                        "type": if role == "assistant" { "output_text" } else { "input_text" },
                         "text": message.content,
                     }],
                 })),

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{Result, ToolCall, ToolError, ToolOutput, ToolSpec};
+use super::{Result, ToolCall, ToolError, ToolOutput, ToolProgressCallback, ToolSpec};
 
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
@@ -16,6 +16,14 @@ pub trait ToolHandler: Send + Sync {
     }
 
     async fn handle(&self, call: ToolCall) -> Result<ToolOutput>;
+
+    async fn handle_with_progress(
+        &self,
+        call: ToolCall,
+        _progress: ToolProgressCallback,
+    ) -> Result<ToolOutput> {
+        self.handle(call).await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -71,6 +79,19 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::UnknownTool(call.name.clone()))?;
 
         handler.handle(call).await
+    }
+
+    pub async fn dispatch_with_progress(
+        &self,
+        call: ToolCall,
+        progress: ToolProgressCallback,
+    ) -> Result<ToolOutput> {
+        let handler = self
+            .handlers
+            .get(&call.name)
+            .ok_or_else(|| ToolError::UnknownTool(call.name.clone()))?;
+
+        handler.handle_with_progress(call, progress).await
     }
 }
 
