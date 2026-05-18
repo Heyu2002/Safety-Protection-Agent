@@ -30,7 +30,36 @@ Copy-Item .env.example .env
 编辑 `.env` 后运行：
 
 ```powershell
-cargo run --bin spa-chat -- --prompt "给我一个CVE漏洞初筛流程"
+cargo run --bin spa
+```
+
+`spa` 启动器会默认进入带上下文历史的交互式 CLI。
+
+Windows 下可以一键本地安装：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+这个脚本会自动把 `%USERPROFILE%\.cargo\bin` 加入当前用户 PATH，并安装 `spa` / `spa-chat`。安装后可以直接运行：
+
+```powershell
+spa
+```
+
+也可以直接传入单次问题：
+
+```powershell
+cargo run --bin spa -- --prompt "给我一个CVE漏洞初筛流程"
+```
+
+REPL 内可以使用 `/compact` 压缩当前上下文，使用 `/clear` 清空上下文，使用 `/exit` 退出。
+在交互式终端里输入 `/` 会展开命令菜单，也可以按 Tab 补全斜杠命令。
+
+底层的 `spa-chat` 命令仍然保留：
+
+```powershell
+cargo run --bin spa-chat -- --repl
 ```
 
 如果需要查看实际 provider、模型和 base URL：

@@ -13,10 +13,15 @@ path = "src/lib.rs"
 name = "spa-chat"
 path = "src/bin/chat.rs"
 
+[[bin]]
+name = "spa"
+path = "src/bin/spa.rs"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = "0.29"
 dotenvy = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

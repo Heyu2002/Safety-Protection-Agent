@@ -30,7 +30,38 @@ Copy-Item .env.example .env
 Edit `.env`, then run:
 
 ```powershell
-cargo run --bin spa-chat -- --prompt "Give me a short CVE triage checklist"
+cargo run --bin spa
+```
+
+The `spa` launcher starts an interactive CLI session with conversation history.
+For one-click local installation on Windows, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+The install script adds `%USERPROFILE%\.cargo\bin` to the current user's PATH
+when needed, installs the binaries, and then `spa` can be started directly:
+
+```powershell
+spa
+```
+
+You can also send a single prompt:
+
+```powershell
+cargo run --bin spa -- --prompt "Give me a short CVE triage checklist"
+```
+
+Inside the REPL, use `/compact` to summarize the current context, `/clear` to
+reset context, and `/exit` to quit.
+When running in an interactive terminal, type `/` to open the command menu or
+press Tab to complete slash commands.
+
+The lower-level `spa-chat` binary is still available:
+
+```powershell
+cargo run --bin spa-chat -- --repl
 ```
 
 ### Library Usage
