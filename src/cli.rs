@@ -667,10 +667,22 @@ async fn dispatch_with_progress(
     call: ToolCall,
 ) -> anyhow::Result<crate::tools::ToolOutput> {
     let progress = Arc::new(|progress: crate::tools::ToolProgress| {
-        println!(
-            "Tool progress: {} {}% - {}",
-            progress.tool_name, progress.percent, progress.message
-        );
+        if let Some(checked_item) = progress
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("checked_item"))
+            .and_then(Value::as_str)
+        {
+            println!(
+                "Tool checklist: {} {}/{} - [x] {}",
+                progress.tool_name, progress.completed_units, progress.total_units, checked_item
+            );
+        } else {
+            println!(
+                "Tool progress: {} {}% - {}",
+                progress.tool_name, progress.percent, progress.message
+            );
+        }
     });
 
     registry

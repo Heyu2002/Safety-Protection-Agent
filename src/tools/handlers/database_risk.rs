@@ -222,14 +222,10 @@ async fn run_scan(plan: ScanPlan, progress: Option<ToolProgressCallback>) -> Dat
         .build()
         .unwrap_or_else(|_| Client::new());
     let baseline = send_probe(&client, &plan, None, None).await;
-    let total = planned_probe_count(plan.fields.len(), plan.include_time_based);
+    let checklist = scan_checklist(&plan.fields, plan.include_time_based);
+    let total = checklist.len() as u64;
     let mut completed = 1;
-    emit_progress(
-        progress.as_ref(),
-        completed,
-        total,
-        "baseline request completed",
-    );
+    emit_progress(progress.as_ref(), completed, total, &checklist);
 
     if plan.fields.is_empty() {
         return DatabaseRiskReport::empty(plan, baseline);
@@ -239,35 +235,20 @@ async fn run_scan(plan: ScanPlan, progress: Option<ToolProgressCallback>) -> Dat
     for field in &plan.fields {
         let error_probe = send_probe(&client, &plan, Some(field), Some("'")).await;
         completed += 1;
-        emit_progress(progress.as_ref(), completed, total, "quote probe completed");
+        emit_progress(progress.as_ref(), completed, total, &checklist);
 
         let boolean_true = send_probe(&client, &plan, Some(field), Some("' OR '1'='1")).await;
         completed += 1;
-        emit_progress(
-            progress.as_ref(),
-            completed,
-            total,
-            "boolean true probe completed",
-        );
+        emit_progress(progress.as_ref(), completed, total, &checklist);
 
         let boolean_false = send_probe(&client, &plan, Some(field), Some("' AND '1'='2")).await;
         completed += 1;
-        emit_progress(
-            progress.as_ref(),
-            completed,
-            total,
-            "boolean false probe completed",
-        );
+        emit_progress(progress.as_ref(), completed, total, &checklist);
 
         let time_probe = if plan.include_time_based {
             let probe = send_probe(&client, &plan, Some(field), Some("' OR SLEEP(1)--")).await;
             completed += 1;
-            emit_progress(
-                progress.as_ref(),
-                completed,
-                total,
-                "time-delay probe completed",
-            );
+            emit_progress(progress.as_ref(), completed, total, &checklist);
             Some(probe)
         } else {
             None
@@ -665,26 +646,53 @@ fn recommendations_for(risk_level: &str) -> Vec<String> {
     recommendations
 }
 
-fn planned_probe_count(fields: usize, include_time_based: bool) -> u64 {
-    let per_field = if include_time_based { 4 } else { 3 };
-    1 + fields as u64 * per_field
+fn scan_checklist(fields: &[String], include_time_based: bool) -> Vec<String> {
+    let mut checklist = vec!["Baseline request".to_owned()];
+    for field in fields {
+        checklist.push(format!("{field}: quote/error leakage probe"));
+        checklist.push(format!("{field}: boolean true probe"));
+        checklist.push(format!("{field}: boolean false probe"));
+        if include_time_based {
+            checklist.push(format!("{field}: time-delay probe"));
+        }
+    }
+    checklist
 }
 
 fn emit_progress(
     progress: Option<&ToolProgressCallback>,
     completed: u64,
     total: u64,
-    message: &str,
+    checklist: &[String],
 ) {
     let Some(progress) = progress else {
         return;
     };
-    progress(ToolProgress::new(
-        "database_risk_scan",
-        message.to_owned(),
-        completed,
-        total,
-    ));
+    let checked_index = completed.saturating_sub(1) as usize;
+    let checked_item = checklist.get(checked_index).cloned().unwrap_or_default();
+    let items: Vec<_> = checklist
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            json!({
+                "label": label,
+                "checked": index < completed as usize
+            })
+        })
+        .collect();
+
+    progress(
+        ToolProgress::new(
+            "database_risk_scan",
+            format!("checked: {checked_item}"),
+            completed,
+            total,
+        )
+        .with_metadata(json!({
+            "checked_item": checked_item,
+            "checklist": items
+        })),
+    );
 }
 
 fn bounded(tool: &str, field: &str, value: u64, min: u64, max: u64) -> Result<u64> {
@@ -749,6 +757,23 @@ mod tests {
         upsert_query_param(&mut url, "id", "'");
 
         assert!(url.as_str().contains("id=%27"));
+    }
+
+    #[test]
+    fn builds_scan_checklist_for_each_probe() {
+        let fields = vec!["date".to_owned()];
+
+        assert_eq!(
+            scan_checklist(&fields, true),
+            vec![
+                "Baseline request".to_owned(),
+                "date: quote/error leakage probe".to_owned(),
+                "date: boolean true probe".to_owned(),
+                "date: boolean false probe".to_owned(),
+                "date: time-delay probe".to_owned(),
+            ]
+        );
+        assert_eq!(scan_checklist(&fields, false).len(), 4);
     }
 
     #[tokio::test]
