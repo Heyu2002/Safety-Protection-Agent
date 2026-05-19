@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{Result, ToolCall, ToolError, ToolOutput, ToolProgressCallback, ToolSpec};
+use super::{
+    DatabaseRiskScanTool, EchoTool, HttpLoadTestTool, Result, ToolCall, ToolError, ToolOutput,
+    ToolProgressCallback, ToolSpec,
+};
 
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
@@ -41,11 +44,11 @@ impl ToolRegistry {
     }
 
     pub fn with_builtins() -> Result<Self> {
-        let mut builder = Self::builder();
-        for tool in crate::tools::built_in_tools() {
-            builder = builder.register_boxed(tool)?;
-        }
-        Ok(builder.build())
+        Self::builder()
+            .register(EchoTool)?
+            .register(HttpLoadTestTool)?
+            .register(DatabaseRiskScanTool)
+            .map(ToolRegistryBuilder::build)
     }
 
     pub fn has(&self, name: &str) -> bool {

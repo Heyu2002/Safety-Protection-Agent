@@ -14,8 +14,10 @@ use crate::agent::prompt::{
 use crate::llm::{
     ChatMessage, ChatRole, CompletionRequest, LlmClient, LlmConfig, client_from_config,
 };
-use crate::tools::{ToolCall, ToolRegistry};
+use crate::tools::{ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
+use serde::Deserialize;
+use serde_json::Value;
 use serde_json::json;
 
 const COMPACT_MAX_TOKENS: u32 = 1200;
@@ -123,11 +125,7 @@ async fn run_once(
 ) -> anyhow::Result<()> {
     let mut messages = Vec::new();
     messages.push(ChatMessage::system(system));
-    messages.push(ChatMessage::user(prompt));
-
-    let response = complete(client, &messages, temperature, max_tokens).await?;
-    println!("{response}");
-
+    submit_repl_turn(client, &mut messages, prompt, temperature, max_tokens).await?;
     Ok(())
 }
 
@@ -598,95 +596,74 @@ async fn submit_repl_turn(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
 ) -> anyhow::Result<()> {
-    if let Some(turn) = maybe_run_local_tool(&prompt, history).await? {
-        match turn {
-            LocalToolTurn::Clarify { url, reason } => {
-                let response = clarify_local_tool_request(client, &url, reason).await?;
-                println!("{response}");
-                history.push(ChatMessage::user(prompt));
-                history.push(ChatMessage::assistant(response));
-            }
-            LocalToolTurn::ToolResult {
-                content,
-                metadata,
-                tool_name,
-            } => {
-                println!("{content}");
-                println!("Analyzing tool result with AI...");
-                let analysis = analyze_tool_result(client, tool_name, &metadata).await?;
-                let response = format_tool_output(&content, &metadata, &analysis);
-                println!("\n{analysis}");
-                history.push(ChatMessage::user(prompt));
-                history.push(ChatMessage::assistant(response));
-            }
-        }
-        return Ok(());
-    }
-
-    history.push(ChatMessage::user(prompt));
-    let response = complete(client, history, temperature, max_tokens).await?;
+    let response = run_agent_loop(client, history, &prompt, temperature, max_tokens).await?;
     println!("{response}");
+    history.push(ChatMessage::user(prompt));
     history.push(ChatMessage::assistant(response));
     Ok(())
 }
 
-enum LocalToolTurn {
-    Clarify {
-        url: String,
-        reason: &'static str,
-    },
-    ToolResult {
-        content: String,
-        metadata: serde_json::Value,
-        tool_name: &'static str,
-    },
-}
-
-async fn maybe_run_local_tool(
-    prompt: &str,
+async fn run_agent_loop(
+    client: &dyn LlmClient,
     history: &[ChatMessage],
-) -> anyhow::Result<Option<LocalToolTurn>> {
-    if !looks_like_load_test_request(prompt, history) {
-        return Ok(None);
+    prompt: &str,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> anyhow::Result<String> {
+    let registry = ToolRegistry::with_builtins()?;
+    let tools = registry.specs();
+    let mut loop_messages = build_agent_messages(history, prompt, &tools);
+
+    for _ in 0..6 {
+        let raw = complete(
+            client,
+            &loop_messages,
+            temperature.or(Some(0.1)),
+            max_tokens,
+        )
+        .await?;
+        let Some(decision) = parse_agent_decision(&raw) else {
+            return Ok(raw);
+        };
+
+        match decision {
+            AgentDecision::Ask { message } | AgentDecision::Final { message } => {
+                return Ok(message);
+            }
+            AgentDecision::CallTool { tool_name, input } => {
+                if !registry.has(&tool_name) {
+                    loop_messages.push(ChatMessage::assistant(raw));
+                    loop_messages.push(ChatMessage::user(format!(
+                        "Tool call failed: unknown tool `{tool_name}`. Choose one of: {}.",
+                        tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                    continue;
+                }
+
+                println!("Running tool: {tool_name}");
+                let output = dispatch_with_progress(&registry, ToolCall::new(&tool_name, input))
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                println!("{}", output.content);
+                println!("Analyzing tool result with AI...");
+
+                loop_messages.push(ChatMessage::assistant(raw));
+                loop_messages.push(ChatMessage::user(format_tool_result_for_agent(
+                    &tool_name, &output,
+                )));
+            }
+        }
     }
 
-    let Some(url) = extract_first_http_url(prompt).or_else(|| latest_http_url(history)) else {
-        return Ok(None);
-    };
-
-    let Some(method) = extract_http_method(prompt) else {
-        return Ok(Some(LocalToolTurn::Clarify {
-            url,
-            reason: "missing HTTP method and request input details",
-        }));
-    };
-
-    println!("Running tool: http_load_test ({method} {url})");
-    let registry = ToolRegistry::with_builtins()?;
-    let duration_secs = 60;
-    let call = ToolCall::new(
-        "http_load_test",
-        json!({
-            "url": url,
-            "method": method,
-            "duration_secs": duration_secs,
-            "requests_per_minute": 600,
-            "concurrency": 32,
-            "timeout_ms": 10000
-        }),
-    );
-    let output = dispatch_with_progress(registry, call).await?;
-    let metadata = output.metadata.unwrap_or_else(|| json!({}));
-
-    Ok(Some(LocalToolTurn::ToolResult {
-        content: output.content,
-        metadata,
-        tool_name: "http_load_test",
-    }))
+    Ok("工具调用循环超过最大轮次，请补充更明确的请求信息后重试。".to_owned())
 }
 
 async fn dispatch_with_progress(
-    registry: ToolRegistry,
+    registry: &ToolRegistry,
     call: ToolCall,
 ) -> anyhow::Result<crate::tools::ToolOutput> {
     let progress = Arc::new(|progress: crate::tools::ToolProgress| {
@@ -702,135 +679,66 @@ async fn dispatch_with_progress(
         .map_err(Into::into)
 }
 
-async fn analyze_tool_result(
-    client: &dyn LlmClient,
-    tool_name: &str,
-    metadata: &serde_json::Value,
-) -> anyhow::Result<String> {
-    let prompt = format!(
-        "Analyze this {tool_name} result in Chinese for a developer. Explain what the metrics mean, whether the endpoint looks healthy, any latency or error risks, and concrete next steps. Do not repeat the full JSON.\n\n```json\n{}\n```",
-        pretty_json(metadata)
-    );
-
-    complete(
-        client,
-        &[
-            ChatMessage::system(
-                "You analyze local tool results for a defensive security and reliability agent.",
-            ),
-            ChatMessage::user(prompt),
-        ],
-        Some(0.2),
-        Some(800),
-    )
-    .await
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum AgentDecision {
+    Ask { message: String },
+    CallTool { tool_name: String, input: Value },
+    Final { message: String },
 }
 
-async fn clarify_local_tool_request(
-    client: &dyn LlmClient,
-    url: &str,
-    reason: &str,
-) -> anyhow::Result<String> {
-    let prompt = format!(
-        "The user wants to run an HTTP load test, but the tool must not run yet.\nURL: {url}\nMissing information: {reason}\n\nAsk the user in Chinese to confirm the HTTP method and whether the request needs a body, headers, or token. Be concise. Do not use Markdown code fences. Do not claim that the load test has started."
-    );
-
-    complete(
-        client,
-        &[
-            ChatMessage::system("You ask concise clarification questions before local tool calls."),
-            ChatMessage::user(prompt),
-        ],
-        Some(0.2),
-        Some(300),
-    )
-    .await
+fn build_agent_messages(
+    history: &[ChatMessage],
+    prompt: &str,
+    tools: &[ToolSpec],
+) -> Vec<ChatMessage> {
+    let mut messages = vec![ChatMessage::system(format_agent_loop_system_prompt(tools))];
+    messages.extend(history.iter().map(copy_message));
+    messages.push(ChatMessage::user(prompt));
+    messages
 }
 
-fn looks_like_load_test_request(prompt: &str, history: &[ChatMessage]) -> bool {
-    let prompt_lower = prompt.to_ascii_lowercase();
-    prompt.contains("\u{538b}\u{6d4b}")
-        || prompt_lower.contains("load test")
-        || prompt_lower.contains("stress test")
-        || (mentions_http_method(prompt) && previous_user_asked_for_load_test(history))
-}
-
-fn previous_user_asked_for_load_test(history: &[ChatMessage]) -> bool {
-    history.iter().rev().take(4).any(|message| {
-        matches!(message.role, ChatRole::User)
-            && (message.content.contains("\u{538b}\u{6d4b}")
-                || message.content.to_ascii_lowercase().contains("load test")
-                || message.content.to_ascii_lowercase().contains("stress test"))
-    })
-}
-
-fn mentions_http_method(prompt: &str) -> bool {
-    extract_http_method(prompt).is_some()
-}
-
-fn extract_http_method(prompt: &str) -> Option<&'static str> {
-    let lower = prompt.to_ascii_lowercase();
-    for (needle, method) in [
-        ("options", "OPTIONS"),
-        ("delete", "DELETE"),
-        ("patch", "PATCH"),
-        ("post", "POST"),
-        ("head", "HEAD"),
-        ("put", "PUT"),
-        ("get", "GET"),
-    ] {
-        if lower.contains(needle) {
-            return Some(method);
-        }
-    }
-
-    None
-}
-
-fn latest_http_url(history: &[ChatMessage]) -> Option<String> {
-    history
-        .iter()
-        .rev()
-        .find_map(|message| extract_first_http_url(&message.content))
-}
-
-fn extract_first_http_url(text: &str) -> Option<String> {
-    let start = text.find("http://").or_else(|| text.find("https://"))?;
-    let rest = &text[start..];
-    let end = rest
-        .char_indices()
-        .find_map(|(index, ch)| {
-            if index == 0 {
-                return None;
-            }
-            if ch.is_whitespace() || is_url_trailing_boundary(ch) {
-                Some(index)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(rest.len());
-
-    Some(rest[..end].to_owned())
-}
-
-fn is_url_trailing_boundary(ch: char) -> bool {
-    !ch.is_ascii()
-        || matches!(
-            ch,
-            '`' | ',' | '.' | ';' | ')' | ']' | '}' | '"' | '\'' | '<' | '>'
-        )
-}
-
-fn format_tool_output(content: &str, metadata: &serde_json::Value, analysis: &str) -> String {
+fn format_agent_loop_system_prompt(tools: &[ToolSpec]) -> String {
     format!(
-        "{content}\n\nAI analysis:\n{analysis}\n\nTool metadata:\n```json\n{}\n```",
-        pretty_json(metadata)
+        "{}\n\nYou are now running inside an agent loop. You can either answer normally, ask for missing information, or call exactly one local tool.\n\nAvailable tools:\n{}\n\nDecision protocol:\nReturn exactly one JSON object and no Markdown, no code fences, no extra text.\nUse one of these shapes:\n{{\"action\":\"ask\",\"message\":\"...\"}}\n{{\"action\":\"call_tool\",\"tool_name\":\"tool_name\",\"input\":{{...}}}}\n{{\"action\":\"final\",\"message\":\"...\"}}\n\nRules:\n- Use conversation history to resolve follow-up answers. If the user first gave a URL and later says \"1.get 2.date=2026-05-13\", combine them yourself.\n- Call tools only for authorized/local/defensive testing requests.\n- If a tool needs required fields that are missing or ambiguous, ask a concise Chinese clarification question instead of guessing.\n- Never call database_risk_scan with only a bare URL. It needs at least one testable input point: query params in the URL, query_params, JSON body fields, or injectable_fields. If the user gives only a bare URL, ask for HTTP method and actual params/body fields.\n- After a tool result is provided, return a final Chinese analysis for the developer. Do not repeat full JSON.\n- For database_risk_scan, prefer GET when the user says get, include query params in the url when supplied, and avoid inventing params.\n- For http_load_test, ask for method/body/headers when not clear before calling.\n",
+        default_system_prompt(),
+        format_tools_for_agent(tools)
     )
 }
 
-fn pretty_json(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+fn format_tools_for_agent(tools: &[ToolSpec]) -> String {
+    tools
+        .iter()
+        .map(|tool| {
+            format!(
+                "- name: {}\n  description: {}\n  input_schema: {}",
+                tool.name, tool.description, tool.input_schema
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_agent_decision(raw: &str) -> Option<AgentDecision> {
+    serde_json::from_str::<AgentDecision>(raw.trim())
+        .ok()
+        .or_else(|| extract_json_object(raw).and_then(|json| serde_json::from_str(&json).ok()))
+}
+
+fn extract_json_object(raw: &str) -> Option<String> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    (end > start).then(|| raw[start..=end].to_owned())
+}
+
+fn format_tool_result_for_agent(tool_name: &str, output: &ToolOutput) -> String {
+    json!({
+        "type": "tool_result",
+        "tool_name": tool_name,
+        "content": output.content,
+        "metadata": output.metadata,
+    })
+    .to_string()
 }
 
 async fn complete(
@@ -1023,58 +931,45 @@ mod tests {
     }
 
     #[test]
-    fn extracts_url_embedded_in_chinese_text() {
-        assert_eq!(
-            extract_first_http_url(
-                "\u{5e2e}\u{6211}\u{538b}\u{6d4b}http://localhost:5173/api/v2/operation/test\u{8fd9}\u{4e2a}"
-            ),
-            Some("http://localhost:5173/api/v2/operation/test".to_owned())
-        );
+    fn parses_agent_tool_call_decision() {
+        let decision = parse_agent_decision(
+            r#"{"action":"call_tool","tool_name":"database_risk_scan","input":{"url":"http://localhost/test?date=2026-05-13","method":"GET"}}"#,
+        )
+        .expect("decision should parse");
+
+        match decision {
+            AgentDecision::CallTool { tool_name, input } => {
+                assert_eq!(tool_name, "database_risk_scan");
+                assert_eq!(input["method"], "GET");
+            }
+            _ => panic!("expected tool call"),
+        }
     }
 
     #[test]
-    fn extracts_url_before_trailing_backtick() {
-        assert_eq!(
-            extract_first_http_url("`http://localhost:5173/api/v2/operation/test`"),
-            Some("http://localhost:5173/api/v2/operation/test".to_owned())
-        );
+    fn parses_agent_decision_inside_text() {
+        let decision = parse_agent_decision(
+            "```json\n{\"action\":\"ask\",\"message\":\"请提供 HTTP 方法和参数。\"}\n```",
+        )
+        .expect("decision should parse from fenced text");
+
+        match decision {
+            AgentDecision::Ask { message } => assert!(message.contains("HTTP")),
+            _ => panic!("expected ask"),
+        }
     }
 
     #[test]
-    fn routes_followup_get_to_previous_load_test_url() {
-        let history = vec![ChatMessage::user(
-            "\u{5e2e}\u{6211}\u{538b}\u{6d4b} http://localhost:5173/api/v2/operation/test",
+    fn agent_prompt_includes_tool_schemas_and_followup_rule() {
+        let tools = vec![ToolSpec::new(
+            "database_risk_scan",
+            "Probe database risk.",
+            json!({"type":"object","required":["url"]}),
         )];
+        let prompt = format_agent_loop_system_prompt(&tools);
 
-        assert!(looks_like_load_test_request(
-            "this endpoint is get",
-            &history
-        ));
-        assert_eq!(
-            latest_http_url(&history),
-            Some("http://localhost:5173/api/v2/operation/test".to_owned())
-        );
-    }
-
-    #[test]
-    fn asks_for_method_before_running_load_test() {
-        let history = Vec::new();
-
-        assert!(looks_like_load_test_request(
-            "\u{5e2e}\u{6211}\u{538b}\u{6d4b} http://localhost:5173/api/v2/operation/test",
-            &history
-        ));
-        assert_eq!(
-            extract_http_method(
-                "\u{5e2e}\u{6211}\u{538b}\u{6d4b} http://localhost:5173/api/v2/operation/test"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn extracts_explicit_http_method() {
-        assert_eq!(extract_http_method("this endpoint is get"), Some("GET"));
-        assert_eq!(extract_http_method("POST body is {}"), Some("POST"));
+        assert!(prompt.contains("database_risk_scan"));
+        assert!(prompt.contains("1.get 2.date=2026-05-13"));
+        assert!(prompt.contains("\"action\":\"call_tool\""));
     }
 }

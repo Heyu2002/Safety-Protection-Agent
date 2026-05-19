@@ -64,6 +64,39 @@ The lower-level `spa-chat` binary is still available:
 cargo run --bin spa-chat -- --repl
 ```
 
+### MCP Server
+
+`spa-mcp` exposes the built-in tools over stdio using the MCP data model from
+the `rmcp` crate:
+
+```powershell
+cargo run --bin spa-mcp
+```
+
+Available tools include:
+
+- `http_load_test`: paced HTTP load testing with progress callbacks and
+  structured metrics.
+- `database_risk_scan`: defensive database attack-surface probing for SQL
+  error leakage, boolean-difference signals, and optional short time-delay
+  behavior.
+- `echo`: tool-call plumbing check.
+
+Long-running tool calls support MCP progress notifications when the client
+passes `_meta.progressToken`.
+
+### Tool Layout
+
+The tool package follows the Codex-style split:
+
+- `src/tools/spec.rs`: shared tool call, output, progress, and schema structs.
+- `src/tools/registry.rs`: tool registration and lookup.
+- `src/tools/router.rs`: tool-call routing through the registry.
+- `src/tools/handlers.rs` and `src/tools/handlers/`: concrete tool handlers.
+
+Add new tools under `src/tools/handlers/`, export them from
+`src/tools/handlers.rs`, then register them in `ToolRegistry::with_builtins`.
+
 ### Agent System Prompt
 
 The default Safety Protection Agent system prompt lives in

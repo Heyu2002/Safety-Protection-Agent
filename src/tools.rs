@@ -1,11 +1,11 @@
-mod builtins;
 mod error;
-mod load_test;
+mod handlers;
 mod registry;
-mod types;
+mod router;
+mod spec;
 
-pub use builtins::{EchoTool, built_in_tools};
 pub use error::{Result, ToolError};
-pub use load_test::HttpLoadTestTool;
+pub use handlers::{DatabaseRiskScanTool, EchoTool, HttpLoadTestTool};
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};
-pub use types::{ToolCall, ToolOutput, ToolProgress, ToolProgressCallback, ToolSpec};
+pub use router::ToolRouter;
+pub use spec::{ToolCall, ToolOutput, ToolProgress, ToolProgressCallback, ToolSpec};
