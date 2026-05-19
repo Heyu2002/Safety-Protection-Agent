@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{
-    DatabaseRiskScanTool, EchoTool, HttpLoadTestTool, Result, ToolCall, ToolError, ToolOutput,
-    ToolProgressCallback, ToolSpec,
+    DatabaseRiskScanTool, EchoTool, HttpLoadTestTool, HttpSecurityHeadersScanTool, Result,
+    ToolCall, ToolError, ToolOutput, ToolProgressCallback, ToolSpec,
 };
 
 #[async_trait]
@@ -47,6 +47,7 @@ impl ToolRegistry {
         Self::builder()
             .register(EchoTool)?
             .register(HttpLoadTestTool)?
+            .register(HttpSecurityHeadersScanTool)?
             .register(DatabaseRiskScanTool)
             .map(ToolRegistryBuilder::build)
     }

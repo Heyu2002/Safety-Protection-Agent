@@ -689,6 +689,7 @@ fn emit_progress(
             total,
         )
         .with_metadata(json!({
+            "display_type": "checklist",
             "checked_item": checked_item,
             "checklist": items
         })),

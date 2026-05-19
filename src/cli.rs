@@ -1,11 +1,15 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::queue;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType};
+use std::collections::HashSet;
+use std::future::Future;
 use std::io::{IsTerminal, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::time;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::prompt::{
@@ -14,6 +18,8 @@ use crate::agent::prompt::{
 use crate::llm::{
     ChatMessage, ChatRole, CompletionRequest, LlmClient, LlmConfig, client_from_config,
 };
+use crate::mcp_client::RemoteMcpToolbox;
+use crate::mcp_client::{add_stdio_mcp_server, load_remote_mcp_configs, spa_config_path};
 use crate::tools::{ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
 use serde::Deserialize;
@@ -46,6 +52,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "clear conversation history",
     },
     SlashCommand {
+        name: "/mcp",
+        description: "list configured MCP servers",
+    },
+    SlashCommand {
         name: "/exit",
         description: "quit",
     },
@@ -57,6 +67,9 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 
 #[derive(Debug, Parser)]
 pub struct ChatCliArgs {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
     #[arg(short, long)]
     prompt: Option<String>,
 
@@ -73,10 +86,36 @@ pub struct ChatCliArgs {
     repl: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    Add(McpAddArgs),
+    List,
+}
+
+#[derive(Debug, Args)]
+struct McpAddArgs {
+    name: String,
+
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+}
+
 pub async fn run_chat_cli(default_repl: bool) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let args = ChatCliArgs::parse();
+    if let Some(command) = args.command {
+        return run_cli_command(command).await;
+    }
+
     let config = LlmConfig::from_env()?;
     if args.debug {
         eprintln!(
@@ -116,6 +155,70 @@ pub async fn run_chat_cli(default_repl: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_cli_command(command: CliCommand) -> anyhow::Result<()> {
+    match command {
+        CliCommand::Mcp { command } => match command {
+            McpCommand::Add(args) => {
+                let path = add_stdio_mcp_server(&args.name, &args.command)?;
+                println!("Added MCP server `{}` to {}.", args.name, path.display());
+                println!("Command: {}", args.command.join(" "));
+                println!("Run `spa mcp list` or start `spa` and use `/mcp` to verify servers.");
+                Ok(())
+            }
+            McpCommand::List => {
+                print_mcp_servers(true)?;
+                Ok(())
+            }
+        },
+    }
+}
+
+fn print_mcp_servers(show_config_path: bool) -> anyhow::Result<()> {
+    let configs = load_remote_mcp_configs()?;
+    if show_config_path {
+        println!("MCP config: {}", spa_config_path().display());
+    } else {
+        println!("MCP servers:");
+    }
+    if configs.is_empty() {
+        println!("  no MCP servers configured.");
+        return Ok(());
+    }
+
+    let name_width = configs
+        .iter()
+        .map(|config| UnicodeWidthStr::width(config.name.as_str()))
+        .max()
+        .unwrap_or(0)
+        .max("名称".width());
+    let desc_width = configs
+        .iter()
+        .map(|config| UnicodeWidthStr::width(mcp_server_description(config).as_str()))
+        .max()
+        .unwrap_or(0)
+        .max("描述".width())
+        .min(88);
+
+    println!("  {}", mcp_table_separator(name_width, desc_width));
+    println!(
+        "  | {} | {} |",
+        pad_display("名称", name_width),
+        pad_display("描述", desc_width)
+    );
+    println!("  {}", mcp_table_separator(name_width, desc_width));
+    for config in &configs {
+        let description = mcp_server_description(config);
+        println!(
+            "  | {} | {} |",
+            pad_display(&config.name, name_width),
+            pad_display(&truncate_display(&description, desc_width), desc_width)
+        );
+    }
+    println!("  {}", mcp_table_separator(name_width, desc_width));
+
+    Ok(())
+}
+
 async fn run_once(
     client: &dyn LlmClient,
     system: String,
@@ -140,7 +243,7 @@ async fn run_repl(
     history.push(ChatMessage::system(&system));
 
     println!("Safety Protection Agent");
-    println!("Interactive chat started. Commands: /help, /compact, /clear, /exit");
+    println!("Interactive chat started. Commands: /help, /compact, /clear, /mcp, /exit");
     if ReplInput::supports_line_editor() {
         println!("Type / to open the command menu, or press Tab to complete commands.");
     }
@@ -183,6 +286,9 @@ async fn run_repl(
                 history.clear();
                 history.push(ChatMessage::system(&system));
                 println!("History cleared.");
+            }
+            "/mcp" => {
+                print_mcp_servers(false)?;
             }
             _ => {
                 submit_repl_turn(
@@ -512,6 +618,62 @@ fn print_slash_commands() {
     }
 }
 
+fn mcp_table_separator(name_width: usize, desc_width: usize) -> String {
+    format!(
+        "+-{}-+-{}-+",
+        "-".repeat(name_width),
+        "-".repeat(desc_width)
+    )
+}
+
+fn mcp_server_description(config: &crate::mcp_client::RemoteMcpServerConfig) -> String {
+    match config.transport {
+        crate::mcp_client::RemoteMcpTransport::Stdio => {
+            let command = config.command.as_deref().unwrap_or_default();
+            if config.args.is_empty() {
+                format!("stdio: {command}")
+            } else {
+                format!("stdio: {command} {}", config.args.join(" "))
+            }
+        }
+        crate::mcp_client::RemoteMcpTransport::StreamableHttp => format!(
+            "streamable-http: {}",
+            config.url.as_deref().unwrap_or_default()
+        ),
+    }
+}
+
+fn pad_display(value: &str, width: usize) -> String {
+    let current = UnicodeWidthStr::width(value);
+    if current >= width {
+        value.to_owned()
+    } else {
+        format!("{}{}", value, " ".repeat(width - current))
+    }
+}
+
+fn truncate_display(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width <= 1 {
+        return "…".to_owned();
+    }
+
+    let mut output = String::new();
+    let mut width = 0usize;
+    for ch in value.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width + 1 > max_width {
+            break;
+        }
+        output.push(ch);
+        width += ch_width;
+    }
+    output.push('…');
+    output
+}
+
 async fn compact_history(
     client: &dyn LlmClient,
     history: &mut Vec<ChatMessage>,
@@ -529,7 +691,7 @@ async fn compact_history(
     println!("Compacting {} messages...", messages.len());
 
     let prompt = format_compact_prompt(&messages);
-    let summary = complete(
+    let summary = complete_with_thinking(
         client,
         &[
             ChatMessage::system(COMPACT_SYSTEM_PROMPT),
@@ -611,11 +773,20 @@ async fn run_agent_loop(
     max_tokens: Option<u32>,
 ) -> anyhow::Result<String> {
     let registry = ToolRegistry::with_builtins()?;
-    let tools = registry.specs();
-    let mut loop_messages = build_agent_messages(history, prompt, &tools);
+    let remote_mcp = match RemoteMcpToolbox::from_env().await {
+        Ok(remote_mcp) => remote_mcp,
+        Err(error) => RemoteMcpToolbox::with_connection_error(format!(
+            "failed to load remote MCP configuration: {error}"
+        )),
+    };
+    let mut tools = registry.specs();
+    tools.extend(remote_mcp.specs());
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut loop_messages = build_agent_messages(history, prompt, &tools, &remote_mcp);
+    let mut tool_call_signatures = HashSet::new();
 
-    for _ in 0..6 {
-        let raw = complete(
+    loop {
+        let raw = complete_with_thinking(
             client,
             &loop_messages,
             temperature.or(Some(0.1)),
@@ -623,15 +794,17 @@ async fn run_agent_loop(
         )
         .await?;
         let Some(decision) = parse_agent_decision(&raw) else {
+            remote_mcp.shutdown().await;
             return Ok(raw);
         };
 
         match decision {
             AgentDecision::Ask { message } | AgentDecision::Final { message } => {
+                remote_mcp.shutdown().await;
                 return Ok(message);
             }
             AgentDecision::CallTool { tool_name, input } => {
-                if !registry.has(&tool_name) {
+                if !registry.has(&tool_name) && !remote_mcp.has(&tool_name) {
                     loop_messages.push(ChatMessage::assistant(raw));
                     loop_messages.push(ChatMessage::user(format!(
                         "Tool call failed: unknown tool `{tool_name}`. Choose one of: {}.",
@@ -644,12 +817,28 @@ async fn run_agent_loop(
                     continue;
                 }
 
-                println!("Running tool: {tool_name}");
-                let output = dispatch_with_progress(&registry, ToolCall::new(&tool_name, input))
-                    .await
-                    .map_err(anyhow::Error::from)?;
-                println!("{}", output.content);
-                println!("Analyzing tool result with AI...");
+                let call_signature = format!(
+                    "{}:{}",
+                    tool_name,
+                    serde_json::to_string(&input).unwrap_or_else(|_| input.to_string())
+                );
+                if !tool_call_signatures.insert(call_signature) {
+                    loop_messages.push(ChatMessage::assistant(raw));
+                    loop_messages.push(ChatMessage::user(format!(
+                        "Repeated tool call skipped: `{tool_name}` with the same input was already executed. Use the existing tool observation and return a final Chinese analysis now."
+                    )));
+                    continue;
+                }
+
+                let output = if registry.has(&tool_name) {
+                    println!("Running tool: {tool_name}");
+                    dispatch_with_progress(&registry, ToolCall::new(&tool_name, input))
+                        .await
+                        .map_err(anyhow::Error::from)?
+                } else {
+                    println!("Running MCP tool: {tool_name}");
+                    remote_mcp.call(&tool_name, input).await?
+                };
 
                 loop_messages.push(ChatMessage::assistant(raw));
                 loop_messages.push(ChatMessage::user(format_tool_result_for_agent(
@@ -658,30 +847,16 @@ async fn run_agent_loop(
             }
         }
     }
-
-    Ok("工具调用循环超过最大轮次，请补充更明确的请求信息后重试。".to_owned())
 }
 
 async fn dispatch_with_progress(
     registry: &ToolRegistry,
     call: ToolCall,
 ) -> anyhow::Result<crate::tools::ToolOutput> {
-    let progress = Arc::new(|progress: crate::tools::ToolProgress| {
-        if let Some(checked_item) = progress
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("checked_item"))
-            .and_then(Value::as_str)
-        {
-            println!(
-                "Tool checklist: {} {}/{} - [x] {}",
-                progress.tool_name, progress.completed_units, progress.total_units, checked_item
-            );
-        } else {
-            println!(
-                "Tool progress: {} {}% - {}",
-                progress.tool_name, progress.percent, progress.message
-            );
+    let render_state = Arc::new(Mutex::new(ProgressRenderState::default()));
+    let progress = Arc::new(move |progress: crate::tools::ToolProgress| {
+        if let Ok(mut state) = render_state.lock() {
+            render_tool_progress(&progress, &mut state);
         }
     });
 
@@ -689,6 +864,144 @@ async fn dispatch_with_progress(
         .dispatch_with_progress(call, progress)
         .await
         .map_err(Into::into)
+}
+
+#[derive(Debug, Default)]
+struct ProgressRenderState {
+    block_lines: usize,
+}
+
+fn render_tool_progress(progress: &crate::tools::ToolProgress, state: &mut ProgressRenderState) {
+    if progress
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("display_type"))
+        .and_then(Value::as_str)
+        == Some("checklist")
+    {
+        if let Some(lines) = checklist_progress_lines(progress) {
+            render_checklist_in_place(&lines, state);
+            return;
+        }
+    }
+
+    println!(
+        "Tool progress: {} {}% - {}",
+        progress.tool_name, progress.percent, progress.message
+    );
+}
+
+fn checklist_progress_lines(progress: &crate::tools::ToolProgress) -> Option<Vec<String>> {
+    let checklist = progress.metadata.as_ref()?.get("checklist")?.as_array()?;
+    let mut rows = Vec::new();
+
+    for item in checklist {
+        let label = item.get("label").and_then(Value::as_str)?;
+        let checked = item
+            .get("checked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let marker = if checked { "✓" } else { "○" };
+        rows.push(format!("{marker} {label}"));
+    }
+
+    Some(checklist_box_lines(&rows))
+}
+
+fn checklist_box_lines(rows: &[String]) -> Vec<String> {
+    let content_width = rows
+        .iter()
+        .map(|row| UnicodeWidthStr::width(row.as_str()))
+        .max()
+        .unwrap_or(0);
+    let border = "─".repeat(content_width + 2);
+    let mut lines = Vec::with_capacity(rows.len() + 2);
+    lines.push(format!("┌{border}┐"));
+    for row in rows {
+        let padding =
+            " ".repeat(content_width.saturating_sub(UnicodeWidthStr::width(row.as_str())));
+        lines.push(format!("│ {row}{padding} │"));
+    }
+    lines.push(format!("└{border}┘"));
+    lines
+}
+
+fn render_checklist_in_place(lines: &[String], state: &mut ProgressRenderState) {
+    let mut stdout = std::io::stdout();
+    if state.block_lines > 0 {
+        let _ = queue!(stdout, cursor::MoveUp(state.block_lines as u16));
+    }
+
+    let line_count = state.block_lines.max(lines.len());
+    for index in 0..line_count {
+        let _ = queue!(
+            stdout,
+            cursor::MoveToColumn(0),
+            terminal::Clear(ClearType::CurrentLine)
+        );
+        if let Some(line) = lines.get(index) {
+            let _ = write!(stdout, "{line}");
+        }
+        if index + 1 < line_count {
+            let _ = queue!(stdout, cursor::MoveDown(1));
+        } else {
+            let _ = writeln!(stdout);
+        }
+    }
+
+    let _ = stdout.flush();
+    state.block_lines = lines.len();
+}
+
+async fn render_ai_spinner_until<F>(future: F) -> anyhow::Result<String>
+where
+    F: Future<Output = anyhow::Result<String>>,
+{
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut interval = time::interval(Duration::from_millis(90));
+    let mut index = 0usize;
+    tokio::pin!(future);
+
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                clear_spinner_line();
+                return result;
+            }
+            _ = interval.tick() => {
+                render_spinner_frame(frames[index % frames.len()]);
+                index += 1;
+            }
+        }
+    }
+}
+
+fn render_spinner_frame(frame: &str) {
+    let mut stdout = std::io::stdout();
+    let _ = queue!(
+        stdout,
+        cursor::MoveToColumn(0),
+        terminal::Clear(ClearType::CurrentLine),
+        SetForegroundColor(Color::Rgb {
+            r: 255,
+            g: 176,
+            b: 0,
+        })
+    );
+    let _ = write!(stdout, "{frame} thinking");
+    let _ = queue!(stdout, ResetColor);
+    let _ = stdout.flush();
+}
+
+fn clear_spinner_line() {
+    let mut stdout = std::io::stdout();
+    let _ = queue!(
+        stdout,
+        cursor::MoveToColumn(0),
+        terminal::Clear(ClearType::CurrentLine),
+        ResetColor
+    );
+    let _ = stdout.flush();
 }
 
 #[derive(Debug, Deserialize)]
@@ -703,19 +1016,52 @@ fn build_agent_messages(
     history: &[ChatMessage],
     prompt: &str,
     tools: &[ToolSpec],
+    remote_mcp: &RemoteMcpToolbox,
 ) -> Vec<ChatMessage> {
-    let mut messages = vec![ChatMessage::system(format_agent_loop_system_prompt(tools))];
+    let mut messages = vec![ChatMessage::system(format_agent_loop_system_prompt(
+        tools, remote_mcp,
+    ))];
     messages.extend(history.iter().map(copy_message));
     messages.push(ChatMessage::user(prompt));
     messages
 }
 
-fn format_agent_loop_system_prompt(tools: &[ToolSpec]) -> String {
-    format!(
-        "{}\n\nYou are now running inside an agent loop. You can either answer normally, ask for missing information, or call exactly one local tool.\n\nAvailable tools:\n{}\n\nDecision protocol:\nReturn exactly one JSON object and no Markdown, no code fences, no extra text.\nUse one of these shapes:\n{{\"action\":\"ask\",\"message\":\"...\"}}\n{{\"action\":\"call_tool\",\"tool_name\":\"tool_name\",\"input\":{{...}}}}\n{{\"action\":\"final\",\"message\":\"...\"}}\n\nRules:\n- Use conversation history to resolve follow-up answers. If the user first gave a URL and later says \"1.get 2.date=2026-05-13\", combine them yourself.\n- Call tools only for authorized/local/defensive testing requests.\n- If a tool needs required fields that are missing or ambiguous, ask a concise Chinese clarification question instead of guessing.\n- Never call database_risk_scan with only a bare URL. It needs at least one testable input point: query params in the URL, query_params, JSON body fields, or injectable_fields. If the user gives only a bare URL, ask for HTTP method and actual params/body fields.\n- After a tool result is provided, return a final Chinese analysis for the developer. Do not repeat full JSON.\n- For database_risk_scan, prefer GET when the user says get, include query params in the url when supplied, and avoid inventing params.\n- For http_load_test, ask for method/body/headers when not clear before calling.\n",
-        default_system_prompt(),
-        format_tools_for_agent(tools)
-    )
+fn format_agent_loop_system_prompt(tools: &[ToolSpec], remote_mcp: &RemoteMcpToolbox) -> String {
+    let agent_loop_instructions = format!(
+        r#"You are now running inside an agent loop. You can either answer normally, ask for missing information, or call exactly one local or remote MCP tool.
+
+Available tools:
+{}
+
+Remote MCP status:
+{}
+
+Decision protocol:
+Return exactly one JSON object and no Markdown, no code fences, no extra text.
+Use one of these shapes:
+{{"action":"ask","message":"..."}}
+{{"action":"call_tool","tool_name":"tool_name","input":{{...}}}}
+{{"action":"final","message":"..."}}
+
+Rules:
+- Use conversation history to resolve follow-up answers. If the user first gave a URL and later says "1.get 2.date=2026-05-13", combine them yourself.
+- Call tools only for authorized/local/defensive testing requests.
+- Remote MCP tools are named like mcp__server__tool. Use them when they can inspect a target website, browse pages, fetch target context, or provide capabilities that local tools do not have.
+- If chrome-devtools MCP tools are available, do not claim you cannot access localhost, 127.0.0.1, or a browser page. Call the relevant MCP browser tool first. Only report a connection problem after an MCP tool call returns that concrete error.
+- Browser MCP observations are evidence. After navigate/snapshot/click returns enough page context to answer the user's security question, stop calling tools and return a final Chinese analysis. Do not keep browsing just because more links or buttons exist.
+- Do not repeat the same tool call with the same input. If a previous tool result already contains the current page, URL, visible text, or error, use that observation instead of calling another tool.
+- Keep MCP browsing focused: use the tools needed to complete the task, but do not browse aimlessly.
+- If a tool needs required fields that are missing or ambiguous, ask a concise Chinese clarification question instead of guessing.
+- Never call database_risk_scan with only a bare URL. It needs at least one testable input point: query params in the URL, query_params, JSON body fields, or injectable_fields. If the user gives only a bare URL, ask for HTTP method and actual params/body fields.
+- After a tool result is provided, return a final Chinese analysis for the developer. Do not repeat full JSON.
+- For database_risk_scan, prefer GET when the user says get, include query params in the url when supplied, and avoid inventing params.
+- For http_load_test, ask for method/body/headers when not clear before calling.
+"#,
+        format_tools_for_agent(tools),
+        format_remote_mcp_status(remote_mcp)
+    );
+
+    format!("{}\n\n{}", default_system_prompt(), agent_loop_instructions)
 }
 
 fn format_tools_for_agent(tools: &[ToolSpec]) -> String {
@@ -731,16 +1077,74 @@ fn format_tools_for_agent(tools: &[ToolSpec]) -> String {
         .join("\n")
 }
 
+fn format_remote_mcp_status(remote_mcp: &RemoteMcpToolbox) -> String {
+    if remote_mcp.connection_errors().is_empty() {
+        if remote_mcp.is_configured() {
+            "Remote MCP tools are connected and included in Available tools.".to_owned()
+        } else {
+            "No remote MCP servers are configured.".to_owned()
+        }
+    } else {
+        format!(
+            "Some remote MCP servers are unavailable:\n{}",
+            remote_mcp.connection_errors().join("\n")
+        )
+    }
+}
+
 fn parse_agent_decision(raw: &str) -> Option<AgentDecision> {
     serde_json::from_str::<AgentDecision>(raw.trim())
         .ok()
-        .or_else(|| extract_json_object(raw).and_then(|json| serde_json::from_str(&json).ok()))
+        .or_else(|| {
+            extract_json_objects(raw)
+                .into_iter()
+                .find_map(|json| serde_json::from_str(&json).ok())
+        })
 }
 
-fn extract_json_object(raw: &str) -> Option<String> {
-    let start = raw.find('{')?;
-    let end = raw.rfind('}')?;
-    (end > start).then(|| raw[start..=end].to_owned())
+fn extract_json_objects(raw: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if in_string {
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start_index) = start.take() {
+                        objects.push(raw[start_index..=index].to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    objects
 }
 
 fn format_tool_result_for_agent(tool_name: &str, output: &ToolOutput) -> String {
@@ -769,6 +1173,15 @@ async fn complete(
 
     let response = client.complete(request).await?;
     Ok(response.content)
+}
+
+async fn complete_with_thinking(
+    client: &dyn LlmClient,
+    messages: &[ChatMessage],
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> anyhow::Result<String> {
+    render_ai_spinner_until(complete(client, messages, temperature, max_tokens)).await
 }
 
 fn copy_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -891,7 +1304,7 @@ mod tests {
             .map(|item| item.command.name)
             .collect();
 
-        assert_eq!(names, vec!["/help", "/compact", "/clear", "/exit"]);
+        assert_eq!(names, vec!["/help", "/compact", "/clear", "/mcp", "/exit"]);
     }
 
     #[test]
@@ -972,16 +1385,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_agent_decision_when_model_leaks_text_and_repeats_json() {
+        let raw = r#"{"action":"call_tool","tool_name":"mcp__chrome-devtools__new_page","input":{"url":"http://127.0.0.1/dvwa/vulnerabilities/open_redirect/","timeout":5000}}
+_HANDLE tool result? Actually must return JSON only. Since we call tool, final content is call_tool JSON.{"action":"call_tool","tool_name":"mcp__chrome-devtools__new_page","input":{"url":"http://127.0.0.1/dvwa/vulnerabilities/open_redirect/","timeout":5000}}"#;
+
+        let decision = parse_agent_decision(raw).expect("decision should parse despite extra text");
+
+        match decision {
+            AgentDecision::CallTool { tool_name, input } => {
+                assert_eq!(tool_name, "mcp__chrome-devtools__new_page");
+                assert_eq!(
+                    input["url"],
+                    "http://127.0.0.1/dvwa/vulnerabilities/open_redirect/"
+                );
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
     fn agent_prompt_includes_tool_schemas_and_followup_rule() {
         let tools = vec![ToolSpec::new(
             "database_risk_scan",
             "Probe database risk.",
             json!({"type":"object","required":["url"]}),
         )];
-        let prompt = format_agent_loop_system_prompt(&tools);
+        let prompt = format_agent_loop_system_prompt(&tools, &RemoteMcpToolbox::empty());
 
         assert!(prompt.contains("database_risk_scan"));
         assert!(prompt.contains("1.get 2.date=2026-05-13"));
         assert!(prompt.contains("\"action\":\"call_tool\""));
+        assert!(prompt.contains("Remote MCP status"));
     }
 }
