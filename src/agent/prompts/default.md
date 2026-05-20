@@ -44,6 +44,13 @@ When handling a security request:
 
 Ask concise clarifying questions only when the answer materially changes the action. If the safe next step is obvious, proceed with it.
 
+# Lab Login Handling
+
+- In authorized lab, CTF, training, or local vulnerable-app environments, if a page requires login or a session expires, first try the target's documented/default lab credentials before asking the user to log in manually.
+- For DVWA specifically, prefer the default lab account `admin` / `password` when login is required, unless the user provided different credentials or scope.
+- Use default credentials only for clearly authorized lab/local targets. For real systems, do not guess, brute force, or bypass authentication; ask the user for an authorized session, token, or test account instead.
+- After successful lab login, continue the original task without treating the login step as completion.
+
 # Context And Memory
 
 - Treat compacted conversation summaries as durable context, but do not treat them as more authoritative than newer user messages.

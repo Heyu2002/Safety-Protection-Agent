@@ -30,6 +30,15 @@ mod tests {
     }
 
     #[test]
+    fn default_prompt_defines_lab_login_handling() {
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("# Lab Login Handling"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("authorized lab"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("DVWA"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("admin"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("password"));
+    }
+
+    #[test]
     fn compact_prompt_preserves_operational_context() {
         assert!(COMPACT_SYSTEM_PROMPT.contains("# Compact Conversation History"));
         assert!(COMPACT_SYSTEM_PROMPT.contains("commands"));

@@ -759,10 +759,18 @@ async fn submit_repl_turn(
     max_tokens: Option<u32>,
 ) -> anyhow::Result<()> {
     let response = run_agent_loop(client, history, &prompt, temperature, max_tokens).await?;
-    println!("{response}");
+    if !response.already_displayed {
+        println!("{}", response.message);
+    }
     history.push(ChatMessage::user(prompt));
-    history.push(ChatMessage::assistant(response));
+    history.push(ChatMessage::assistant(response.message));
     Ok(())
+}
+
+#[derive(Debug)]
+struct AgentLoopResponse {
+    message: String,
+    already_displayed: bool,
 }
 
 async fn run_agent_loop(
@@ -771,7 +779,7 @@ async fn run_agent_loop(
     prompt: &str,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AgentLoopResponse> {
     let registry = ToolRegistry::with_builtins()?;
     let remote_mcp = match RemoteMcpToolbox::from_env().await {
         Ok(remote_mcp) => remote_mcp,
@@ -784,6 +792,8 @@ async fn run_agent_loop(
     tools.sort_by(|left, right| left.name.cmp(&right.name));
     let mut loop_messages = build_agent_messages(history, prompt, &tools, &remote_mcp);
     let mut tool_call_signatures = HashSet::new();
+    let mut awaiting_completion_confirmation = false;
+    let mut last_displayed_model_message: Option<String> = None;
 
     loop {
         let raw = complete_with_thinking(
@@ -794,16 +804,61 @@ async fn run_agent_loop(
         )
         .await?;
         let Some(decision) = parse_agent_decision(&raw) else {
-            remote_mcp.shutdown().await;
-            return Ok(raw);
+            display_intermediate_model_message(&raw);
+            last_displayed_model_message = Some(normalize_visible_message(&raw));
+            loop_messages.push(ChatMessage::assistant(raw.clone()));
+            loop_messages.push(ChatMessage::user(format_completion_confirmation_prompt(
+                "freeform_response",
+                &raw,
+                awaiting_completion_confirmation,
+            )));
+            awaiting_completion_confirmation = true;
+            continue;
         };
 
         match decision {
-            AgentDecision::Ask { message } | AgentDecision::Final { message } => {
-                remote_mcp.shutdown().await;
-                return Ok(message);
+            AgentDecision::Ask { message } => {
+                if awaiting_completion_confirmation {
+                    remote_mcp.shutdown().await;
+                    let already_displayed = was_visible_model_message_already_displayed(
+                        &last_displayed_model_message,
+                        &message,
+                    );
+                    return Ok(AgentLoopResponse {
+                        message,
+                        already_displayed,
+                    });
+                }
+                display_intermediate_model_message(&message);
+                last_displayed_model_message = Some(normalize_visible_message(&message));
+                loop_messages.push(ChatMessage::assistant(raw));
+                loop_messages.push(ChatMessage::user(format_completion_confirmation_prompt(
+                    "ask", &message, false,
+                )));
+                awaiting_completion_confirmation = true;
+            }
+            AgentDecision::Final { message } => {
+                if awaiting_completion_confirmation {
+                    remote_mcp.shutdown().await;
+                    let already_displayed = was_visible_model_message_already_displayed(
+                        &last_displayed_model_message,
+                        &message,
+                    );
+                    return Ok(AgentLoopResponse {
+                        message,
+                        already_displayed,
+                    });
+                }
+                display_intermediate_model_message(&message);
+                last_displayed_model_message = Some(normalize_visible_message(&message));
+                loop_messages.push(ChatMessage::assistant(raw));
+                loop_messages.push(ChatMessage::user(format_completion_confirmation_prompt(
+                    "final", &message, false,
+                )));
+                awaiting_completion_confirmation = true;
             }
             AgentDecision::CallTool { tool_name, input } => {
+                awaiting_completion_confirmation = false;
                 if !registry.has(&tool_name) && !remote_mcp.has(&tool_name) {
                     loop_messages.push(ChatMessage::assistant(raw));
                     loop_messages.push(ChatMessage::user(format!(
@@ -831,12 +886,10 @@ async fn run_agent_loop(
                 }
 
                 let output = if registry.has(&tool_name) {
-                    println!("Running tool: {tool_name}");
                     dispatch_with_progress(&registry, ToolCall::new(&tool_name, input))
                         .await
                         .map_err(anyhow::Error::from)?
                 } else {
-                    println!("Running MCP tool: {tool_name}");
                     remote_mcp.call(&tool_name, input).await?
                 };
 
@@ -847,6 +900,58 @@ async fn run_agent_loop(
             }
         }
     }
+}
+
+fn display_intermediate_model_message(message: &str) {
+    let message = message.trim();
+    if !message.is_empty() {
+        println!("{message}");
+    }
+}
+
+fn normalize_visible_message(message: &str) -> String {
+    message.trim().to_owned()
+}
+
+fn was_visible_model_message_already_displayed(
+    displayed_message: &Option<String>,
+    final_message: &str,
+) -> bool {
+    let normalized = normalize_visible_message(final_message);
+    displayed_message.as_deref() == Some(normalized.as_str())
+}
+
+fn format_completion_confirmation_prompt(
+    candidate_kind: &str,
+    candidate_message: &str,
+    previous_confirmation_failed: bool,
+) -> String {
+    let retry_note = if previous_confirmation_failed {
+        "Your previous completion check still did not produce a valid decision. "
+    } else {
+        ""
+    };
+
+    format!(
+        r#"{retry_note}Before the runtime shows anything to the user, perform a completion check for the original user request.
+
+Candidate response kind: {candidate_kind}
+Candidate response:
+{candidate_message}
+
+Return exactly one JSON object and no Markdown, no code fences, no extra text.
+Use one of these shapes:
+{{"action":"final","message":"polished Chinese answer for the user"}}
+{{"action":"ask","message":"concise Chinese question for missing information"}}
+{{"action":"call_tool","tool_name":"tool_name","input":{{...}}}}
+
+Decision rules:
+- If the original task is fully handled, return final.
+- If the task is truly blocked on missing user information, return ask.
+- If more work can still be done with available local or MCP tools, return call_tool.
+- If the candidate response is only a progress note, partial analysis, or unsupported claim, continue the agent loop instead of ending.
+"#
+    )
 }
 
 async fn dispatch_with_progress(
@@ -885,10 +990,11 @@ fn render_tool_progress(progress: &crate::tools::ToolProgress, state: &mut Progr
         }
     }
 
-    println!(
-        "Tool progress: {} {}% - {}",
-        progress.tool_name, progress.percent, progress.message
-    );
+    println!("{}", format_percent_progress_line(progress));
+}
+
+fn format_percent_progress_line(progress: &crate::tools::ToolProgress) -> String {
+    format!("进度: {}% - {}", progress.percent, progress.message)
 }
 
 fn checklist_progress_lines(progress: &crate::tools::ToolProgress) -> Option<Vec<String>> {
@@ -1052,7 +1158,10 @@ Rules:
 - Do not repeat the same tool call with the same input. If a previous tool result already contains the current page, URL, visible text, or error, use that observation instead of calling another tool.
 - Keep MCP browsing focused: use the tools needed to complete the task, but do not browse aimlessly.
 - If a tool needs required fields that are missing or ambiguous, ask a concise Chinese clarification question instead of guessing.
+- A final or ask decision is a user-facing candidate. If the runtime asks for a completion check, only confirm final/ask when the original task is actually complete or genuinely blocked; otherwise keep working with tools or reasoning.
 - Never call database_risk_scan with only a bare URL. It needs at least one testable input point: query params in the URL, query_params, JSON body fields, or injectable_fields. If the user gives only a bare URL, ask for HTTP method and actual params/body fields.
+- For database_risk_scan on HTML/PHP forms or DVWA medium/high, use body_format "form" for POST form fields. If the vulnerable value is submitted on one page and rendered on another page, use url for the submission endpoint and verification_url for the page that displays the database-backed result.
+- For database_risk_scan blind SQL injection validation, keep confirm_time_based enabled unless the user asks for the lightest possible scan. Confirmation alternates normal and delayed probes to reduce false positives and must not extract database data.
 - After a tool result is provided, return a final Chinese analysis for the developer. Do not repeat full JSON.
 - For database_risk_scan, prefer GET when the user says get, include query params in the url when supplied, and avoid inventing params.
 - For http_load_test, ask for method/body/headers when not clear before calling.
@@ -1404,6 +1513,46 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
     }
 
     #[test]
+    fn completion_confirmation_prompt_requires_explicit_done_or_continue() {
+        let prompt =
+            format_completion_confirmation_prompt("final", "扫描结果看起来没问题。", false);
+
+        assert!(prompt.contains("completion check"));
+        assert!(prompt.contains("\"action\":\"final\""));
+        assert!(prompt.contains("\"action\":\"ask\""));
+        assert!(prompt.contains("\"action\":\"call_tool\""));
+        assert!(prompt.contains("If more work can still be done"));
+        assert!(prompt.contains("扫描结果看起来没问题。"));
+    }
+
+    #[test]
+    fn percent_progress_line_hides_internal_tool_name() {
+        let progress =
+            crate::tools::ToolProgress::new("http_load_test", "30/100 requests completed", 30, 100);
+
+        let line = format_percent_progress_line(&progress);
+
+        assert!(line.contains("30%"));
+        assert!(line.contains("30/100 requests completed"));
+        assert!(!line.contains("http_load_test"));
+        assert!(!line.contains("Tool progress"));
+    }
+
+    #[test]
+    fn visible_model_message_matching_uses_trimmed_text() {
+        let displayed = Some("阶段性分析完成。".to_string());
+
+        assert!(was_visible_model_message_already_displayed(
+            &displayed,
+            "  阶段性分析完成。\n"
+        ));
+        assert!(!was_visible_model_message_already_displayed(
+            &displayed,
+            "最终分析完成。"
+        ));
+    }
+
+    #[test]
     fn agent_prompt_includes_tool_schemas_and_followup_rule() {
         let tools = vec![ToolSpec::new(
             "database_risk_scan",
@@ -1416,5 +1565,9 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
         assert!(prompt.contains("1.get 2.date=2026-05-13"));
         assert!(prompt.contains("\"action\":\"call_tool\""));
         assert!(prompt.contains("Remote MCP status"));
+        assert!(prompt.contains("completion check"));
+        assert!(prompt.contains("body_format \"form\""));
+        assert!(prompt.contains("verification_url"));
+        assert!(prompt.contains("confirm_time_based"));
     }
 }
