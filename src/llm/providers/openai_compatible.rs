@@ -530,7 +530,7 @@ mod tests {
         });
 
         state.collect_sse_data(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"database_risk_scan","arguments":"{\"url\":\"http://localhost"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"database_risk_scan","arguments":"{\"url\":\"https://target.example"}}]}}]}"#,
             &on_delta,
         );
         state.collect_sse_data(
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(response.tool_calls[0].name, "database_risk_scan");
         assert_eq!(
             response.tool_calls[0].input,
-            json!({"url":"http://localhost/test","method":"GET"})
+            json!({"url":"https://target.example/test","method":"GET"})
         );
         assert_eq!(
             deltas

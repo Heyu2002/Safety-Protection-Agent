@@ -44,7 +44,7 @@ impl ToolHandler for DatabaseRiskScanTool {
                     },
                     "verification_url": {
                         "type": "string",
-                        "description": "Optional URL to fetch after each probe request. Use this for stateful lab flows where one endpoint accepts input and another page renders the database-backed result, for example DVWA high SQLi session-input.php -> vulnerabilities/sqli/."
+                        "description": "Optional URL to fetch after each probe request. Use this for stateful lab flows where one endpoint accepts input and another page renders the database-backed result."
                     },
                     "method": {
                         "type": "string",
@@ -1753,7 +1753,7 @@ mod tests {
 
     #[test]
     fn selects_query_and_body_fields() {
-        let url = Url::parse("http://localhost/search?id=1").expect("url should parse");
+        let url = Url::parse("https://target.example/search?id=1").expect("url should parse");
         let body = json!({ "name": "alice" });
         let fields = selected_fields(&url, &HashMap::new(), Some(&body), None);
 
@@ -1762,7 +1762,7 @@ mod tests {
 
     #[test]
     fn mutates_query_param_when_body_field_is_absent() {
-        let mut url = Url::parse("http://localhost/search?id=1").expect("url should parse");
+        let mut url = Url::parse("https://target.example/search?id=1").expect("url should parse");
 
         upsert_query_param(&mut url, "id", "'");
 
@@ -1791,10 +1791,10 @@ mod tests {
     #[test]
     fn infers_form_body_and_builds_numeric_and_quoted_payloads() {
         let plan = ScanPlan {
-            url: Url::parse("http://127.0.0.1/dvwa/vulnerabilities/sqli/session-input.php")
+            url: Url::parse("https://lab.example/vulnerable/sqli/session-input.php")
                 .expect("url should parse"),
             verification_url: Some(
-                Url::parse("http://127.0.0.1/dvwa/vulnerabilities/sqli/")
+                Url::parse("https://lab.example/vulnerable/sqli/")
                     .expect("verification url should parse"),
             ),
             method: Method::POST,

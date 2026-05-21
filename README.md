@@ -202,21 +202,21 @@ Tool-based reports should explain:
 
 ## Example Workflows
 
-Database risk scan for an authorized local API:
+Database risk scan for an authorized API:
 
 ```text
-user> 帮我测下 http://localhost:5173/api/v2/operation/getApplicationFormAllFilterList 是否有数据库漏洞
+user> 帮我测下 <AUTHORIZED_API_URL> 是否有数据库漏洞
 agent> 请提供 HTTP 方法和实际参数。
-user> GET，参数 date=2026-05-13，不需要鉴权
+user> GET，参数 date=<YYYY-MM-DD>，不需要鉴权
 ```
 
 The agent should combine the conversation history, call `database_risk_scan`,
 show checklist progress, and return a Chinese analysis instead of raw JSON.
 
-DVWA Weak Session IDs lab:
+Weak Session IDs lab:
 
 ```text
-user> 帮我测试 http://127.0.0.1/dvwa/vulnerabilities/weak_id/ 的 Weak Session IDs，安全级别 medium，默认账号登录
+user> 帮我测试 <AUTHORIZED_LAB_URL> 的 Weak Session IDs，安全级别 medium，使用测试账号登录
 ```
 
 When browser MCP is available, the agent can use it to inspect and interact
@@ -225,7 +225,7 @@ with the lab page, then use `weak_session_id_scan` to sample generated IDs.
 HTTP load test:
 
 ```text
-user> 帮我压测 http://localhost:5173/api/v2/operation/test
+user> 帮我压测 <AUTHORIZED_LOAD_TEST_URL>
 agent> 请确认请求方法、是否需要 body/headers，以及目标请求速率。
 ```
 

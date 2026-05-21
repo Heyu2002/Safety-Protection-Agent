@@ -1812,7 +1812,7 @@ mod tests {
     #[test]
     fn parses_json_agent_tool_call_decision() {
         let decision = parse_agent_decision(
-            r#"{"action":"call_tool","tool_name":"database_risk_scan","input":{"url":"http://localhost/test?date=2026-05-13","method":"GET"}}"#,
+            r#"{"action":"call_tool","tool_name":"database_risk_scan","input":{"url":"https://target.example/api/search?date=2026-05-13","method":"GET"}}"#,
         )
         .expect("decision should parse");
 
@@ -1855,8 +1855,8 @@ mod tests {
 
     #[test]
     fn parses_agent_decision_when_model_leaks_text_and_repeats_json() {
-        let raw = r#"{"action":"call_tool","tool_name":"mcp__chrome-devtools__new_page","input":{"url":"http://127.0.0.1/dvwa/vulnerabilities/open_redirect/","timeout":5000}}
-_HANDLE tool result? Actually must return JSON only. Since we call tool, final content is call_tool JSON.{"action":"call_tool","tool_name":"mcp__chrome-devtools__new_page","input":{"url":"http://127.0.0.1/dvwa/vulnerabilities/open_redirect/","timeout":5000}}"#;
+        let raw = r#"{"action":"call_tool","tool_name":"mcp__chrome-devtools__new_page","input":{"url":"https://lab.example/vulnerable/open_redirect/","timeout":5000}}
+_HANDLE tool result? Actually must return JSON only. Since we call tool, final content is call_tool JSON.{"action":"call_tool","tool_name":"mcp__chrome-devtools__new_page","input":{"url":"https://lab.example/vulnerable/open_redirect/","timeout":5000}}"#;
 
         let decision = parse_agent_decision(raw).expect("decision should parse despite extra text");
 
@@ -1865,7 +1865,7 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
                 assert_eq!(tool_name, "mcp__chrome-devtools__new_page");
                 assert_eq!(
                     input["url"],
-                    "http://127.0.0.1/dvwa/vulnerabilities/open_redirect/"
+                    "https://lab.example/vulnerable/open_redirect/"
                 );
             }
             _ => panic!("expected tool call"),

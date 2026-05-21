@@ -972,7 +972,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
         unsafe {
             std::env::remove_var(ENV_MCP_SERVERS);
-            std::env::set_var(ENV_MCP_URL, "http://127.0.0.1:8000/mcp");
+            std::env::set_var(ENV_MCP_URL, "https://mcp.example/mcp");
             std::env::set_var(ENV_MCP_NAME, "browser");
             std::env::remove_var(ENV_MCP_AUTH_TOKEN);
         }
@@ -981,7 +981,7 @@ mod tests {
 
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "browser");
-        assert_eq!(configs[0].url.as_deref(), Some("http://127.0.0.1:8000/mcp"));
+        assert_eq!(configs[0].url.as_deref(), Some("https://mcp.example/mcp"));
 
         unsafe {
             std::env::remove_var(ENV_MCP_URL);
@@ -995,7 +995,7 @@ mod tests {
         unsafe {
             std::env::set_var(
                 ENV_MCP_SERVERS,
-                r#"[{"name":"browser","url":"http://127.0.0.1:8000/mcp","auth_token":"token"}]"#,
+                r#"[{"name":"browser","url":"https://browser-mcp.example/mcp","auth_token":"token"}]"#,
             );
             std::env::remove_var(ENV_MCP_URL);
         }
