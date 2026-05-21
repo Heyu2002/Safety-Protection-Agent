@@ -442,6 +442,9 @@ struct LoadTestMetrics {
     status_counts: BTreeMap<String, u64>,
     error_samples: Vec<String>,
     latency_ms: LatencyMetrics,
+    sample_coverage: Vec<String>,
+    attack_types: Vec<String>,
+    remediation: Vec<String>,
 }
 
 impl LoadTestMetrics {
@@ -479,6 +482,23 @@ impl LoadTestMetrics {
 
         let completed_requests = outcomes.len() as u64;
         let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+        let failed_requests = completed_requests.saturating_sub(successful_requests);
+        let achieved_requests_per_minute = completed_requests as f64 / elapsed_secs * 60.0;
+        let latency_ms = LatencyMetrics::from_latencies(latencies);
+        let sample_coverage = load_test_sample_coverage(
+            &method,
+            duration_secs,
+            target_requests_per_minute,
+            concurrency,
+            planned_requests,
+            completed_requests,
+            successful_requests,
+            failed_requests,
+            achieved_requests_per_minute,
+            &status_counts,
+        );
+        let attack_types = load_test_attack_types();
+        let remediation = load_test_remediation(failed_requests, &latency_ms);
 
         Self {
             url,
@@ -490,11 +510,14 @@ impl LoadTestMetrics {
             planned_requests,
             completed_requests,
             successful_requests,
-            failed_requests: completed_requests.saturating_sub(successful_requests),
-            achieved_requests_per_minute: completed_requests as f64 / elapsed_secs * 60.0,
+            failed_requests,
+            achieved_requests_per_minute,
             status_counts,
             error_samples,
-            latency_ms: LatencyMetrics::from_latencies(latencies),
+            latency_ms,
+            sample_coverage,
+            attack_types,
+            remediation,
         }
     }
 
@@ -508,6 +531,63 @@ impl LoadTestMetrics {
             self.latency_ms.p99.unwrap_or(0)
         )
     }
+}
+
+fn load_test_sample_coverage(
+    method: &str,
+    duration_secs: u64,
+    target_requests_per_minute: u64,
+    concurrency: usize,
+    planned_requests: u64,
+    completed_requests: u64,
+    successful_requests: u64,
+    failed_requests: u64,
+    achieved_requests_per_minute: f64,
+    status_counts: &BTreeMap<String, u64>,
+) -> Vec<String> {
+    vec![
+        format!("HTTP method exercised: {method}."),
+        format!("Scheduled {planned_requests} request(s) over {duration_secs} second(s)."),
+        format!(
+            "Target rate: {target_requests_per_minute} rpm; achieved rate: {achieved_requests_per_minute:.1} rpm."
+        ),
+        format!("Concurrency cap: {concurrency} in-flight request(s)."),
+        format!(
+            "Completed {completed_requests} request(s): {successful_requests} successful, {failed_requests} failed."
+        ),
+        format!("Observed status distribution: {status_counts:?}."),
+    ]
+}
+
+fn load_test_attack_types() -> Vec<String> {
+    vec![
+        "authorized high-volume request simulation".to_owned(),
+        "availability and saturation testing".to_owned(),
+        "basic rate-limit / anti-automation resilience check".to_owned(),
+    ]
+}
+
+fn load_test_remediation(failed_requests: u64, latency_ms: &LatencyMetrics) -> Vec<String> {
+    let mut remediation = vec![
+        "Add or tune rate limiting, quotas, and backpressure for expensive endpoints.".to_owned(),
+        "Use caching, async queues, or workload shedding for operations that cannot scale linearly."
+            .to_owned(),
+        "Monitor p95/p99 latency, error rates, CPU, memory, database connections, and upstream saturation during load."
+            .to_owned(),
+    ];
+    if failed_requests > 0 {
+        remediation.push(
+            "Investigate non-success responses and timeout errors before increasing traffic volume."
+                .to_owned(),
+        );
+    }
+    if latency_ms.p95.unwrap_or(0) > 1_000 {
+        remediation.push(
+            "Profile slow request paths and database queries because p95 latency exceeded 1 second."
+                .to_owned(),
+        );
+    }
+    remediation
 }
 
 #[derive(Debug, Default, Serialize)]

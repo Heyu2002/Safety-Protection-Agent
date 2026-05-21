@@ -604,6 +604,9 @@ struct DatabaseRiskReport {
     tested_fields: Vec<String>,
     risk_level: String,
     summary: String,
+    sample_coverage: Vec<String>,
+    attack_types: Vec<String>,
+    remediation: Vec<String>,
     baseline: ProbeSummary,
     findings: Vec<FieldFinding>,
     issues: Vec<DatabaseRiskIssue>,
@@ -620,6 +623,15 @@ impl DatabaseRiskReport {
             tested_fields: Vec::new(),
             risk_level: "unknown".to_owned(),
             summary: "No injectable query or body fields were provided or detected.".to_owned(),
+            sample_coverage: vec![
+                format!("Baseline request: {} {}", plan.method, plan.url),
+                "No query parameters, JSON body fields, or injectable_fields were available to mutate.".to_owned(),
+            ],
+            attack_types: vec!["scan coverage validation".to_owned()],
+            remediation: vec![
+                "Provide a representative request that includes the database-backed parameter to test.".to_owned(),
+                "Include query parameters, JSON body fields, form fields, or injectable_fields.".to_owned(),
+            ],
             baseline: ProbeSummary::from_observation(&baseline),
             findings: Vec::new(),
             issues: vec![DatabaseRiskIssue {
@@ -660,6 +672,9 @@ impl DatabaseRiskReport {
             .iter()
             .filter(|issue| issue.severity != "info")
             .count();
+        let sample_coverage = database_sample_coverage(&plan, &findings);
+        let attack_types = database_attack_types(&issues);
+        let remediation = database_remediation(&issues, risk_level);
         Self {
             url: plan.url.to_string(),
             verification_url: plan.verification_url.map(|url| url.to_string()),
@@ -668,6 +683,9 @@ impl DatabaseRiskReport {
             tested_fields: plan.fields,
             risk_level: risk_level.to_owned(),
             summary: database_risk_summary(risk_level, risky_fields, issue_count, &issues),
+            sample_coverage,
+            attack_types,
+            remediation,
             baseline: ProbeSummary::from_observation(&baseline),
             findings,
             issues,
@@ -966,6 +984,12 @@ fn selected_fields(
 fn push_unique(items: &mut Vec<String>, item: String) {
     if !item.is_empty() && !items.contains(&item) {
         items.push(item);
+    }
+}
+
+fn push_unique_string(items: &mut Vec<String>, item: &str) {
+    if !item.is_empty() && !items.iter().any(|existing| existing == item) {
+        items.push(item.to_owned());
     }
 }
 
@@ -1516,6 +1540,88 @@ fn evidence_for_any_signal(findings: &[FieldFinding], signal_kinds: &[&str]) -> 
                 .map(move |signal| format!("{}: {}", finding.field, signal.evidence))
         })
         .collect()
+}
+
+fn database_sample_coverage(plan: &ScanPlan, findings: &[FieldFinding]) -> Vec<String> {
+    let mut coverage = vec![
+        format!("Baseline request: {} {}", plan.method, plan.url),
+        format!("Body format: {}", body_format_label(plan.body_format)),
+        format!(
+            "Tested {} field(s): {}",
+            plan.fields.len(),
+            if plan.fields.is_empty() {
+                "<none>".to_owned()
+            } else {
+                plan.fields.join(", ")
+            }
+        ),
+        "For each field, exercised quote/error probes and boolean true/false probes.".to_owned(),
+    ];
+    if let Some(verification_url) = &plan.verification_url {
+        coverage.push(format!(
+            "Stateful verification page fetched after each probe: {verification_url}"
+        ));
+    }
+    if plan.include_time_based {
+        coverage.push(format!(
+            "Included time-delay probes with threshold {} ms.",
+            plan.max_time_delay_ms
+        ));
+        if plan.confirm_time_based {
+            coverage.push(format!(
+                "Confirmed time-delay findings with {} baseline/delayed pair(s).",
+                plan.time_confirmation_runs
+            ));
+        }
+    }
+    for finding in findings {
+        coverage.push(format!(
+            "Field `{}` produced {} signal(s), field risk {}.",
+            finding.field,
+            finding.signals.len(),
+            finding.risk
+        ));
+    }
+    coverage
+}
+
+fn database_attack_types(issues: &[DatabaseRiskIssue]) -> Vec<String> {
+    let mut attack_types = Vec::new();
+    for issue in issues {
+        match issue.category.as_str() {
+            "sql_injection" => push_unique_string(&mut attack_types, "SQL injection"),
+            "sql_injection_signal" => {
+                if issue.title.contains("Time") {
+                    push_unique_string(&mut attack_types, "time-based blind SQL injection");
+                } else if issue.title.contains("Boolean") {
+                    push_unique_string(&mut attack_types, "boolean-based SQL injection");
+                } else {
+                    push_unique_string(&mut attack_types, "SQL injection signal");
+                }
+            }
+            "information_disclosure" => {
+                push_unique_string(&mut attack_types, "database error information disclosure")
+            }
+            "input_handling" => push_unique_string(&mut attack_types, "malformed input handling"),
+            "scan_coverage" => push_unique_string(&mut attack_types, "scan coverage validation"),
+            category => push_unique_string(&mut attack_types, category),
+        }
+    }
+    if attack_types.is_empty() {
+        attack_types.push("database injection probe".to_owned());
+    }
+    attack_types
+}
+
+fn database_remediation(issues: &[DatabaseRiskIssue], risk_level: &str) -> Vec<String> {
+    let mut remediation = Vec::new();
+    for issue in issues {
+        push_unique_string(&mut remediation, &issue.recommendation);
+    }
+    for recommendation in recommendations_for(risk_level) {
+        push_unique_string(&mut remediation, &recommendation);
+    }
+    remediation
 }
 
 fn recommendations_for(risk_level: &str) -> Vec<String> {

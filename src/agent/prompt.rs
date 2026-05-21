@@ -18,6 +18,7 @@ mod tests {
         assert!(DEFAULT_SYSTEM_PROMPT.contains("# Safety Boundaries"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("Safety Protection Agent"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("defensive"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("authorized red-team validation"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("publicly disclosed vulnerabilities"));
     }
 
@@ -27,6 +28,13 @@ mod tests {
         assert!(DEFAULT_SYSTEM_PROMPT.contains("Your product name is Safety Protection Agent"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("Do not introduce yourself as ChatGPT"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("underlying model/provider"));
+    }
+
+    #[test]
+    fn default_prompt_requires_standard_tool_report_sections() {
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("sample coverage"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("attack types"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("how to fix"));
     }
 
     #[test]

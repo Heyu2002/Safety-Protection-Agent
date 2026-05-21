@@ -1162,7 +1162,9 @@ Rules:
 - Never call database_risk_scan with only a bare URL. It needs at least one testable input point: query params in the URL, query_params, JSON body fields, or injectable_fields. If the user gives only a bare URL, ask for HTTP method and actual params/body fields.
 - For database_risk_scan on HTML/PHP forms or DVWA medium/high, use body_format "form" for POST form fields. If the vulnerable value is submitted on one page and rendered on another page, use url for the submission endpoint and verification_url for the page that displays the database-backed result.
 - For database_risk_scan blind SQL injection validation, keep confirm_time_based enabled unless the user asks for the lightest possible scan. Confirmation alternates normal and delayed probes to reduce false positives and must not extract database data.
+- For weak_session_id_scan, sample the endpoint that generates or refreshes the ID. If the user mentions DVWA Weak Session IDs, look for the generated Set-Cookie token, commonly dvwaSession, and use enough samples to detect counters, timestamps, md5(time), and duplicate IDs. Do not attempt session takeover.
 - After a tool result is provided, return a final Chinese analysis for the developer. Do not repeat full JSON.
+- When analyzing any tool result, include the report's three required parts: sample coverage, attack types, and how to fix. If the structured result has sample_coverage, attack_types, or remediation fields, use them directly.
 - For database_risk_scan, prefer GET when the user says get, include query params in the url when supplied, and avoid inventing params.
 - For http_load_test, ask for method/body/headers when not clear before calling.
 "#,
@@ -1569,5 +1571,10 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
         assert!(prompt.contains("body_format \"form\""));
         assert!(prompt.contains("verification_url"));
         assert!(prompt.contains("confirm_time_based"));
+        assert!(prompt.contains("weak_session_id_scan"));
+        assert!(prompt.contains("dvwaSession"));
+        assert!(prompt.contains("sample_coverage"));
+        assert!(prompt.contains("attack_types"));
+        assert!(prompt.contains("remediation"));
     }
 }

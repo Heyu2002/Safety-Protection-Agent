@@ -451,6 +451,9 @@ struct SecurityHeadersReport {
     status: Option<u16>,
     risk_level: String,
     summary: String,
+    sample_coverage: Vec<String>,
+    attack_types: Vec<String>,
+    remediation: Vec<String>,
     findings: Vec<HeaderFinding>,
     observed_headers: BTreeMap<String, String>,
     set_cookie_count: usize,
@@ -467,6 +470,9 @@ impl SecurityHeadersReport {
     ) -> Self {
         let risk_level = aggregate_risk(&findings).to_owned();
         let risky_count = findings.len();
+        let sample_coverage = security_headers_sample_coverage(plan, &observed);
+        let attack_types = security_headers_attack_types(&findings);
+        let remediation = security_headers_remediation(&findings, &risk_level);
         Self {
             url: plan.url.to_string(),
             final_url: Some(observed.final_url),
@@ -476,6 +482,9 @@ impl SecurityHeadersReport {
             summary: format!(
                 "HTTP security header scan completed: {risky_count} finding(s), overall risk {risk_level}."
             ),
+            sample_coverage,
+            attack_types,
+            remediation,
             findings,
             observed_headers: observed.headers,
             set_cookie_count: observed.set_cookies.len(),
@@ -493,6 +502,15 @@ impl SecurityHeadersReport {
             status: None,
             risk_level: "unknown".to_owned(),
             summary: format!("HTTP security header scan failed: {error}"),
+            sample_coverage: vec![format!(
+                "Attempted baseline request: {} {}",
+                plan.method, plan.url
+            )],
+            attack_types: vec!["security header coverage validation".to_owned()],
+            remediation: vec![
+                "Confirm the URL, method, headers, and network reachability before retrying."
+                    .to_owned(),
+            ],
             findings: Vec::new(),
             observed_headers: BTreeMap::new(),
             set_cookie_count: 0,
@@ -575,6 +593,86 @@ fn flatten_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
         }
     }
     flattened
+}
+
+fn security_headers_sample_coverage(plan: &ScanPlan, observed: &ObservedResponse) -> Vec<String> {
+    vec![
+        format!("Baseline request: {} {}", plan.method, plan.url),
+        format!("Final URL after redirects: {}", observed.final_url),
+        format!("HTTP status observed: {}", observed.status),
+        format!("Observed {} response header(s).", observed.headers.len()),
+        format!(
+            "Observed {} Set-Cookie header(s).",
+            observed.set_cookies.len()
+        ),
+        "Sent a controlled Origin probe to evaluate CORS behavior.".to_owned(),
+        format!("Captured body preview up to {} bytes.", BODY_PREVIEW_LIMIT),
+    ]
+}
+
+fn security_headers_attack_types(findings: &[HeaderFinding]) -> Vec<String> {
+    let mut attack_types = Vec::new();
+    for finding in findings {
+        match finding.kind.as_str() {
+            "missing_csp" => push_unique_string(&mut attack_types, "cross-site scripting"),
+            "missing_x_frame_options" => push_unique_string(&mut attack_types, "clickjacking"),
+            "missing_hsts" => {
+                push_unique_string(&mut attack_types, "TLS downgrade / HTTPS stripping")
+            }
+            "missing_x_content_type_options" => {
+                push_unique_string(&mut attack_types, "MIME sniffing")
+            }
+            "missing_referrer_policy" => {
+                push_unique_string(&mut attack_types, "referrer information leakage")
+            }
+            "missing_permissions_policy" => {
+                push_unique_string(&mut attack_types, "browser feature abuse")
+            }
+            "cors_wildcard_with_credentials" | "cors_reflects_probe_origin_with_credentials" => {
+                push_unique_string(&mut attack_types, "credentialed CORS abuse")
+            }
+            "cors_wildcard" | "cors_reflects_probe_origin" => {
+                push_unique_string(&mut attack_types, "overly broad CORS access")
+            }
+            "cookie_missing_httponly" => {
+                push_unique_string(&mut attack_types, "session cookie theft via XSS")
+            }
+            "cookie_missing_secure" => {
+                push_unique_string(&mut attack_types, "session cookie leakage over HTTP")
+            }
+            "cookie_missing_samesite" => {
+                push_unique_string(&mut attack_types, "cross-site request forgery")
+            }
+            "cache_missing_policy" => {
+                push_unique_string(&mut attack_types, "sensitive response caching")
+            }
+            kind if kind.starts_with("server_fingerprint_") => {
+                push_unique_string(&mut attack_types, "technology fingerprinting")
+            }
+            kind => push_unique_string(&mut attack_types, kind),
+        }
+    }
+    if attack_types.is_empty() {
+        attack_types.push("HTTP security header baseline validation".to_owned());
+    }
+    attack_types
+}
+
+fn security_headers_remediation(findings: &[HeaderFinding], risk_level: &str) -> Vec<String> {
+    let mut remediation = Vec::new();
+    for finding in findings {
+        push_unique_string(&mut remediation, &finding.recommendation);
+    }
+    for recommendation in recommendations_for(risk_level) {
+        push_unique_string(&mut remediation, &recommendation);
+    }
+    remediation
+}
+
+fn push_unique_string(items: &mut Vec<String>, item: &str) {
+    if !item.is_empty() && !items.iter().any(|existing| existing == item) {
+        items.push(item.to_owned());
+    }
 }
 
 fn aggregate_risk(findings: &[HeaderFinding]) -> &'static str {
