@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 #[derive(Debug, Clone)]
 pub enum ChatRole {
     System,
@@ -90,4 +92,78 @@ pub struct CompletionResponse {
 pub struct ChatUsage {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl AgentToolSpec {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentTurnRequest {
+    pub messages: Vec<ChatMessage>,
+    pub input_items: Vec<Value>,
+    pub tools: Vec<AgentToolSpec>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
+impl AgentTurnRequest {
+    pub fn new(messages: Vec<ChatMessage>, tools: Vec<AgentToolSpec>) -> Self {
+        Self {
+            messages,
+            input_items: Vec::new(),
+            tools,
+            temperature: None,
+            max_tokens: None,
+        }
+    }
+
+    pub fn with_input_items(mut self, input_items: Vec<Value>) -> Self {
+        self.input_items = input_items;
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentToolCall {
+    pub id: String,
+    pub call_id: String,
+    pub name: String,
+    pub input: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentTurnResponse {
+    pub content: String,
+    pub tool_calls: Vec<AgentToolCall>,
+    pub output_items: Vec<Value>,
+    pub model: String,
+    pub usage: Option<ChatUsage>,
 }

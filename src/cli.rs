@@ -16,10 +16,13 @@ use crate::agent::prompt::{
     COMPACT_SYSTEM_PROMPT, COMPACTED_CONTEXT_PREFIX, default_system_prompt,
 };
 use crate::llm::{
-    ChatMessage, ChatRole, CompletionRequest, LlmClient, LlmConfig, client_from_config,
+    AgentToolCall, AgentToolSpec, AgentTurnRequest, AgentTurnResponse, ChatMessage, ChatRole,
+    CompletionDeltaCallback, CompletionRequest, LlmClient, LlmConfig, client_from_config,
 };
 use crate::mcp_client::RemoteMcpToolbox;
-use crate::mcp_client::{add_stdio_mcp_server, load_remote_mcp_configs, spa_config_path};
+use crate::mcp_client::{
+    RemoteMcpServerConfig, add_stdio_mcp_server, load_remote_mcp_configs, spa_config_path,
+};
 use crate::tools::{ToolCall, ToolOutput, ToolRegistry, ToolSpec};
 
 use serde::Deserialize;
@@ -27,6 +30,14 @@ use serde_json::Value;
 use serde_json::json;
 
 const COMPACT_MAX_TOKENS: u32 = 1200;
+const USER_PROMPT: &str = "user> ";
+const AGENT_PREFIX: &str = "agent> ";
+const USER_PROMPT_COLOR: Color = Color::Rgb {
+    r: 80,
+    g: 170,
+    b: 255,
+};
+const AGENT_PROMPT_COLOR: Color = Color::Green;
 
 struct SlashCommand {
     name: &'static str,
@@ -255,7 +266,7 @@ async fn run_repl(
     let mut input_reader = ReplInput::new()?;
 
     loop {
-        let Some(input) = input_reader.read_line("spa> ")? else {
+        let Some(input) = input_reader.read_line(USER_PROMPT)? else {
             println!();
             break;
         };
@@ -328,8 +339,9 @@ impl ReplInput {
         match self {
             Self::Terminal(reader) => reader.read_line(prompt),
             Self::Plain => {
-                print!("{prompt}");
-                std::io::stdout().flush()?;
+                let mut stdout = std::io::stdout();
+                write_colored_prompt(&mut stdout, prompt, USER_PROMPT_COLOR)?;
+                stdout.flush()?;
 
                 let mut input = String::new();
                 if std::io::stdin().read_line(&mut input)? == 0 {
@@ -393,7 +405,8 @@ impl TerminalLineReader {
                         cursor::MoveToColumn(0),
                         Clear(ClearType::FromCursorDown)
                     )?;
-                    write!(stdout, "{prompt}\r\n")?;
+                    write_colored_prompt(&mut stdout, prompt, USER_PROMPT_COLOR)?;
+                    write!(stdout, "\r\n")?;
                     stdout.flush()?;
                     return Ok(None);
                 }
@@ -535,7 +548,8 @@ fn render_editor(
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown)
     )?;
-    write!(stdout, "{prompt}{line}")?;
+    write_colored_prompt(stdout, prompt, USER_PROMPT_COLOR)?;
+    write!(stdout, "{line}")?;
 
     if !menu_items.is_empty() {
         write!(stdout, "\r\n")?;
@@ -556,6 +570,17 @@ fn render_editor(
         cursor::MoveToColumn(editor_cursor_column(prompt, buffer, cursor_index))
     )?;
     stdout.flush()?;
+    Ok(())
+}
+
+fn write_colored_prompt(
+    stdout: &mut std::io::Stdout,
+    prompt: &str,
+    color: Color,
+) -> anyhow::Result<()> {
+    queue!(stdout, SetForegroundColor(color))?;
+    write!(stdout, "{prompt}")?;
+    queue!(stdout, ResetColor)?;
     Ok(())
 }
 
@@ -760,7 +785,7 @@ async fn submit_repl_turn(
 ) -> anyhow::Result<()> {
     let response = run_agent_loop(client, history, &prompt, temperature, max_tokens).await?;
     if !response.already_displayed {
-        println!("{}", response.message);
+        display_agent_message_streamed(&response.message).await;
     }
     history.push(ChatMessage::user(prompt));
     history.push(ChatMessage::assistant(response.message));
@@ -781,22 +806,55 @@ async fn run_agent_loop(
     max_tokens: Option<u32>,
 ) -> anyhow::Result<AgentLoopResponse> {
     let registry = ToolRegistry::with_builtins()?;
-    let remote_mcp = match RemoteMcpToolbox::from_env().await {
-        Ok(remote_mcp) => remote_mcp,
-        Err(error) => RemoteMcpToolbox::with_connection_error(format!(
-            "failed to load remote MCP configuration: {error}"
-        )),
+    let remote_mcp_configs = load_remote_mcp_configs().unwrap_or_default();
+    let mut remote_mcp = LazyRemoteMcp::new(remote_mcp_configs);
+    let tools = registry.specs();
+
+    let response = if client.supports_native_tools() {
+        run_native_agent_loop(
+            client,
+            history,
+            prompt,
+            temperature,
+            max_tokens,
+            &registry,
+            &mut remote_mcp,
+            &tools,
+        )
+        .await
+    } else {
+        run_fallback_agent_loop(
+            client,
+            history,
+            prompt,
+            temperature,
+            max_tokens,
+            &registry,
+            &mut remote_mcp,
+            &tools,
+        )
+        .await
     };
-    let mut tools = registry.specs();
-    tools.extend(remote_mcp.specs());
-    tools.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut loop_messages = build_agent_messages(history, prompt, &tools, &remote_mcp);
+
+    remote_mcp.shutdown().await;
+    response
+}
+
+async fn run_fallback_agent_loop(
+    client: &dyn LlmClient,
+    history: &[ChatMessage],
+    prompt: &str,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    registry: &ToolRegistry,
+    remote_mcp: &mut LazyRemoteMcp,
+    tools: &[ToolSpec],
+) -> anyhow::Result<AgentLoopResponse> {
+    let mut loop_messages = build_agent_messages(history, prompt, tools, remote_mcp.status());
     let mut tool_call_signatures = HashSet::new();
-    let mut awaiting_completion_confirmation = false;
-    let mut last_displayed_model_message: Option<String> = None;
 
     loop {
-        let raw = complete_with_thinking(
+        let raw = complete_with_thinking_retrying_temperature(
             client,
             &loop_messages,
             temperature.or(Some(0.1)),
@@ -804,62 +862,26 @@ async fn run_agent_loop(
         )
         .await?;
         let Some(decision) = parse_agent_decision(&raw) else {
-            display_intermediate_model_message(&raw);
-            last_displayed_model_message = Some(normalize_visible_message(&raw));
             loop_messages.push(ChatMessage::assistant(raw.clone()));
-            loop_messages.push(ChatMessage::user(format_completion_confirmation_prompt(
-                "freeform_response",
-                &raw,
-                awaiting_completion_confirmation,
-            )));
-            awaiting_completion_confirmation = true;
+            loop_messages.push(ChatMessage::user(format_missing_decision_prompt(&raw)));
             continue;
         };
 
         match decision {
             AgentDecision::Ask { message } => {
-                if awaiting_completion_confirmation {
-                    remote_mcp.shutdown().await;
-                    let already_displayed = was_visible_model_message_already_displayed(
-                        &last_displayed_model_message,
-                        &message,
-                    );
-                    return Ok(AgentLoopResponse {
-                        message,
-                        already_displayed,
-                    });
-                }
-                display_intermediate_model_message(&message);
-                last_displayed_model_message = Some(normalize_visible_message(&message));
-                loop_messages.push(ChatMessage::assistant(raw));
-                loop_messages.push(ChatMessage::user(format_completion_confirmation_prompt(
-                    "ask", &message, false,
-                )));
-                awaiting_completion_confirmation = true;
+                return Ok(AgentLoopResponse {
+                    message,
+                    already_displayed: false,
+                });
             }
             AgentDecision::Final { message } => {
-                if awaiting_completion_confirmation {
-                    remote_mcp.shutdown().await;
-                    let already_displayed = was_visible_model_message_already_displayed(
-                        &last_displayed_model_message,
-                        &message,
-                    );
-                    return Ok(AgentLoopResponse {
-                        message,
-                        already_displayed,
-                    });
-                }
-                display_intermediate_model_message(&message);
-                last_displayed_model_message = Some(normalize_visible_message(&message));
-                loop_messages.push(ChatMessage::assistant(raw));
-                loop_messages.push(ChatMessage::user(format_completion_confirmation_prompt(
-                    "final", &message, false,
-                )));
-                awaiting_completion_confirmation = true;
+                return Ok(AgentLoopResponse {
+                    message,
+                    already_displayed: false,
+                });
             }
             AgentDecision::CallTool { tool_name, input } => {
-                awaiting_completion_confirmation = false;
-                if !registry.has(&tool_name) && !remote_mcp.has(&tool_name) {
+                if !registry.has(&tool_name) && !remote_mcp.maybe_has_name(&tool_name) {
                     loop_messages.push(ChatMessage::assistant(raw));
                     loop_messages.push(ChatMessage::user(format!(
                         "Tool call failed: unknown tool `{tool_name}`. Choose one of: {}.",
@@ -902,54 +924,274 @@ async fn run_agent_loop(
     }
 }
 
-fn display_intermediate_model_message(message: &str) {
-    let message = message.trim();
-    if !message.is_empty() {
-        println!("{message}");
+async fn run_native_agent_loop(
+    client: &dyn LlmClient,
+    history: &[ChatMessage],
+    prompt: &str,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    registry: &ToolRegistry,
+    remote_mcp: &mut LazyRemoteMcp,
+    tools: &[ToolSpec],
+) -> anyhow::Result<AgentLoopResponse> {
+    let messages = build_native_agent_messages(history, prompt, tools, remote_mcp.status());
+    let native_tools: Vec<AgentToolSpec> =
+        tools.iter().map(agent_tool_spec_from_tool_spec).collect();
+    let mut input_items = Vec::new();
+    let mut tool_call_signatures = HashSet::new();
+    let renderer = StreamingAgentRenderer::default();
+    let mut final_content = String::new();
+
+    loop {
+        let mut request = AgentTurnRequest::new(messages.clone(), native_tools.clone())
+            .with_input_items(input_items.clone());
+        if let Some(temperature) = temperature.or(Some(0.1)) {
+            request = request.with_temperature(temperature);
+        }
+        if let Some(max_tokens) = max_tokens {
+            request = request.with_max_tokens(max_tokens);
+        }
+
+        let displayed_before = renderer.delta_count();
+        let renderer_state = renderer.shared_state();
+        let on_delta: CompletionDeltaCallback = Arc::new(move |delta| {
+            if let Ok(mut state) = renderer_state.lock() {
+                state.render_delta(delta);
+            }
+        });
+        let turn = complete_agent_turn_retrying_temperature(client, request, on_delta).await?;
+        renderer.finish_message();
+        let final_turn_displayed = renderer.delta_count() > displayed_before;
+
+        if !turn.content.trim().is_empty() {
+            final_content = turn.content.clone();
+        }
+        input_items.extend(turn.output_items);
+
+        if turn.tool_calls.is_empty() {
+            return Ok(AgentLoopResponse {
+                message: final_content,
+                already_displayed: final_turn_displayed,
+            });
+        }
+
+        for tool_call in turn.tool_calls {
+            let call_signature = format!(
+                "{}:{}",
+                tool_call.name,
+                serde_json::to_string(&tool_call.input)
+                    .unwrap_or_else(|_| tool_call.input.to_string())
+            );
+            let output = if !registry.has(&tool_call.name)
+                && !remote_mcp.maybe_has_name(&tool_call.name)
+            {
+                format!("Tool call failed: unknown tool `{}`.", tool_call.name)
+            } else if !tool_call_signatures.insert(call_signature) {
+                format!(
+                    "Repeated tool call skipped: `{}` with the same input was already executed.",
+                    tool_call.name
+                )
+            } else {
+                execute_agent_tool_call(registry, remote_mcp, &tool_call).await?
+            };
+            input_items.push(json!({
+                "type": "function_call_output",
+                "call_id": tool_call.call_id,
+                "output": output,
+            }));
+        }
     }
 }
 
-fn normalize_visible_message(message: &str) -> String {
-    message.trim().to_owned()
-}
-
-fn was_visible_model_message_already_displayed(
-    displayed_message: &Option<String>,
-    final_message: &str,
-) -> bool {
-    let normalized = normalize_visible_message(final_message);
-    displayed_message.as_deref() == Some(normalized.as_str())
-}
-
-fn format_completion_confirmation_prompt(
-    candidate_kind: &str,
-    candidate_message: &str,
-    previous_confirmation_failed: bool,
-) -> String {
-    let retry_note = if previous_confirmation_failed {
-        "Your previous completion check still did not produce a valid decision. "
+async fn execute_agent_tool_call(
+    registry: &ToolRegistry,
+    remote_mcp: &mut LazyRemoteMcp,
+    tool_call: &AgentToolCall,
+) -> anyhow::Result<String> {
+    let output = if registry.has(&tool_call.name) {
+        dispatch_with_progress(
+            registry,
+            ToolCall {
+                id: tool_call.call_id.clone(),
+                name: tool_call.name.clone(),
+                input: tool_call.input.clone(),
+            },
+        )
+        .await
+        .map_err(anyhow::Error::from)?
     } else {
-        ""
+        remote_mcp
+            .call(&tool_call.name, tool_call.input.clone())
+            .await?
     };
 
-    format!(
-        r#"{retry_note}Before the runtime shows anything to the user, perform a completion check for the original user request.
+    Ok(format_tool_result_for_agent(&tool_call.name, &output))
+}
 
-Candidate response kind: {candidate_kind}
-Candidate response:
-{candidate_message}
+fn agent_tool_spec_from_tool_spec(tool: &ToolSpec) -> AgentToolSpec {
+    AgentToolSpec::new(
+        tool.name.clone(),
+        tool.description.clone(),
+        tool.input_schema.clone(),
+    )
+}
+
+struct LazyRemoteMcp {
+    configs: Vec<RemoteMcpServerConfig>,
+    connected: Option<RemoteMcpToolbox>,
+    status: RemoteMcpToolbox,
+}
+
+impl LazyRemoteMcp {
+    fn new(configs: Vec<RemoteMcpServerConfig>) -> Self {
+        let status = if configs.is_empty() {
+            RemoteMcpToolbox::empty()
+        } else {
+            RemoteMcpToolbox::with_connection_error(format!(
+                "{} MCP server(s) configured. Remote MCP tools will connect lazily when requested.",
+                configs.len()
+            ))
+        };
+
+        Self {
+            configs,
+            connected: None,
+            status,
+        }
+    }
+
+    fn status(&self) -> &RemoteMcpToolbox {
+        self.connected.as_ref().unwrap_or(&self.status)
+    }
+
+    fn maybe_has_name(&self, name: &str) -> bool {
+        self.status().has(name) || name.starts_with("mcp__")
+    }
+
+    async fn call(&mut self, name: &str, input: Value) -> anyhow::Result<ToolOutput> {
+        let toolbox = self.connect_if_needed().await?;
+        toolbox.call(name, input).await
+    }
+
+    async fn connect_if_needed(&mut self) -> anyhow::Result<&RemoteMcpToolbox> {
+        if self.connected.is_none() {
+            let configs = self.configs.clone();
+            self.connected = Some(RemoteMcpToolbox::connect(configs).await?);
+        }
+
+        Ok(self
+            .connected
+            .as_ref()
+            .expect("connected MCP toolbox exists"))
+    }
+
+    async fn shutdown(self) {
+        if let Some(toolbox) = self.connected {
+            toolbox.shutdown().await;
+        }
+    }
+}
+
+#[derive(Default)]
+struct StreamingAgentRenderer {
+    state: Arc<Mutex<StreamingAgentRendererState>>,
+}
+
+impl StreamingAgentRenderer {
+    fn shared_state(&self) -> Arc<Mutex<StreamingAgentRendererState>> {
+        Arc::clone(&self.state)
+    }
+
+    fn finish_message(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.finish_message();
+        }
+    }
+
+    fn delta_count(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.delta_count)
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Default)]
+struct StreamingAgentRendererState {
+    active_message: bool,
+    delta_count: usize,
+}
+
+impl StreamingAgentRendererState {
+    fn render_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+
+        let mut stdout = std::io::stdout();
+        if !self.active_message {
+            let _ = queue!(
+                stdout,
+                SetForegroundColor(AGENT_PROMPT_COLOR),
+                cursor::MoveToColumn(0)
+            );
+            let _ = write!(stdout, "{AGENT_PREFIX}");
+            let _ = queue!(stdout, ResetColor);
+            self.active_message = true;
+        }
+        let _ = write!(stdout, "{delta}");
+        let _ = stdout.flush();
+        self.delta_count += 1;
+    }
+
+    fn finish_message(&mut self) {
+        if self.active_message {
+            let mut stdout = std::io::stdout();
+            let _ = writeln!(stdout);
+            let _ = stdout.flush();
+            self.active_message = false;
+        }
+    }
+}
+
+async fn display_agent_message_streamed(message: &str) {
+    let message = message.trim();
+    if message.is_empty() {
+        return;
+    }
+
+    let mut stdout = std::io::stdout();
+    let _ = queue!(
+        stdout,
+        SetForegroundColor(AGENT_PROMPT_COLOR),
+        cursor::MoveToColumn(0)
+    );
+    let _ = write!(stdout, "{AGENT_PREFIX}");
+    let _ = queue!(stdout, ResetColor);
+    let _ = stdout.flush();
+
+    for ch in message.chars() {
+        let _ = write!(stdout, "{ch}");
+        let _ = stdout.flush();
+        tokio::task::yield_now().await;
+    }
+
+    let _ = writeln!(stdout);
+    let _ = stdout.flush();
+}
+
+fn format_missing_decision_prompt(previous_response: &str) -> String {
+    format!(
+        r#"Your previous response did not follow the fallback tool protocol, so the runtime did not show it to the user.
+
+Previous response:
+{previous_response}
 
 Return exactly one JSON object and no Markdown, no code fences, no extra text.
 Use one of these shapes:
 {{"action":"final","message":"polished Chinese answer for the user"}}
 {{"action":"ask","message":"concise Chinese question for missing information"}}
 {{"action":"call_tool","tool_name":"tool_name","input":{{...}}}}
-
-Decision rules:
-- If the original task is fully handled, return final.
-- If the task is truly blocked on missing user information, return ask.
-- If more work can still be done with available local or MCP tools, return call_tool.
-- If the candidate response is only a progress note, partial analysis, or unsupported claim, continue the agent loop instead of ending.
 "#
     )
 }
@@ -1132,22 +1374,34 @@ fn build_agent_messages(
     messages
 }
 
-fn format_agent_loop_system_prompt(tools: &[ToolSpec], remote_mcp: &RemoteMcpToolbox) -> String {
-    let agent_loop_instructions = format!(
-        r#"You are now running inside an agent loop. You can either answer normally, ask for missing information, or call exactly one local or remote MCP tool.
+fn build_native_agent_messages(
+    history: &[ChatMessage],
+    prompt: &str,
+    tools: &[ToolSpec],
+    remote_mcp: &RemoteMcpToolbox,
+) -> Vec<ChatMessage> {
+    let mut messages = vec![ChatMessage::system(format_native_agent_loop_system_prompt(
+        tools, remote_mcp,
+    ))];
+    messages.extend(history.iter().map(copy_message));
+    messages.push(ChatMessage::user(prompt));
+    messages
+}
 
-Available tools:
+fn format_native_agent_loop_system_prompt(
+    tools: &[ToolSpec],
+    remote_mcp: &RemoteMcpToolbox,
+) -> String {
+    let agent_loop_instructions = format!(
+        r#"You are running inside a Codex-style agent loop with native tool calls.
+
+The runtime provides tools through the model API. Do not describe tool calls in text. When a tool is useful, call the tool natively. When the task is complete, answer the user directly in Chinese. When required information is missing, ask one concise Chinese question.
+
+Available tool names:
 {}
 
 Remote MCP status:
 {}
-
-Decision protocol:
-Return exactly one JSON object and no Markdown, no code fences, no extra text.
-Use one of these shapes:
-{{"action":"ask","message":"..."}}
-{{"action":"call_tool","tool_name":"tool_name","input":{{...}}}}
-{{"action":"final","message":"..."}}
 
 Rules:
 - Use conversation history to resolve follow-up answers. If the user first gave a URL and later says "1.get 2.date=2026-05-13", combine them yourself.
@@ -1158,7 +1412,53 @@ Rules:
 - Do not repeat the same tool call with the same input. If a previous tool result already contains the current page, URL, visible text, or error, use that observation instead of calling another tool.
 - Keep MCP browsing focused: use the tools needed to complete the task, but do not browse aimlessly.
 - If a tool needs required fields that are missing or ambiguous, ask a concise Chinese clarification question instead of guessing.
-- A final or ask decision is a user-facing candidate. If the runtime asks for a completion check, only confirm final/ask when the original task is actually complete or genuinely blocked; otherwise keep working with tools or reasoning.
+- Never call database_risk_scan with only a bare URL. It needs at least one testable input point: query params in the URL, query_params, JSON body fields, or injectable_fields. If the user gives only a bare URL, ask for HTTP method and actual params/body fields.
+- For database_risk_scan on HTML/PHP forms or DVWA medium/high, use body_format "form" for POST form fields. If the vulnerable value is submitted on one page and rendered on another page, use url for the submission endpoint and verification_url for the page that displays the database-backed result.
+- For database_risk_scan blind SQL injection validation, keep confirm_time_based enabled unless the user asks for the lightest possible scan. Confirmation alternates normal and delayed probes to reduce false positives and must not extract database data.
+- For weak_session_id_scan, sample the endpoint that generates or refreshes the ID. If the user mentions DVWA Weak Session IDs, look for the generated Set-Cookie token, commonly dvwaSession, and use enough samples to detect counters, timestamps, md5(time), and duplicate IDs. Do not attempt session takeover.
+- After a tool result is provided, return a final Chinese analysis for the developer. Do not repeat full JSON.
+- When analyzing any tool result, include the report's three required parts: sample coverage, attack types, and how to fix. If the structured result has sample_coverage, attack_types, or remediation fields, use them directly.
+- For database_risk_scan, prefer GET when the user says get, include query params in the url when supplied, and avoid inventing params.
+- For http_load_test, ask for method/body/headers when not clear before calling.
+"#,
+        tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        format_remote_mcp_status(remote_mcp)
+    );
+
+    format!("{}\n\n{}", default_system_prompt(), agent_loop_instructions)
+}
+
+fn format_agent_loop_system_prompt(tools: &[ToolSpec], remote_mcp: &RemoteMcpToolbox) -> String {
+    let agent_loop_instructions = format!(
+        r#"You are now running inside an agent loop. You can either answer normally, ask for missing information, or call exactly one local or remote MCP tool.
+
+Available tools:
+{}
+
+Remote MCP status:
+{}
+
+Fallback decision protocol:
+This provider does not expose reliable native tool calls, so return exactly one JSON object and no Markdown, no code fences, no extra text.
+Use one of these shapes:
+{{"action":"ask","message":"concise Chinese question for missing information"}}
+{{"action":"call_tool","tool_name":"tool_name","input":{{...}}}}
+{{"action":"final","message":"polished Chinese answer for the user"}}
+
+Rules:
+- Use conversation history to resolve follow-up answers. If the user first gave a URL and later says "1.get 2.date=2026-05-13", combine them yourself.
+- Call tools only for authorized/local/defensive testing requests.
+- Remote MCP tools are named like mcp__server__tool. Use them when they can inspect a target website, browse pages, fetch target context, or provide capabilities that local tools do not have.
+- If chrome-devtools MCP tools are available, do not claim you cannot access localhost, 127.0.0.1, or a browser page. Call the relevant MCP browser tool first. Only report a connection problem after an MCP tool call returns that concrete error.
+- Browser MCP observations are evidence. After navigate/snapshot/click returns enough page context to answer the user's security question, stop calling tools and return a final Chinese analysis. Do not keep browsing just because more links or buttons exist.
+- Do not repeat the same tool call with the same input. If a previous tool result already contains the current page, URL, visible text, or error, use that observation instead of calling another tool.
+- Keep MCP browsing focused: use the tools needed to complete the task, but do not browse aimlessly.
+- If a tool needs required fields that are missing or ambiguous, ask a concise Chinese clarification question instead of guessing.
+- Final and ask decisions are shown to the user exactly once. Put the complete user-facing text in the message field.
 - Never call database_risk_scan with only a bare URL. It needs at least one testable input point: query params in the URL, query_params, JSON body fields, or injectable_fields. If the user gives only a bare URL, ask for HTTP method and actual params/body fields.
 - For database_risk_scan on HTML/PHP forms or DVWA medium/high, use body_format "form" for POST form fields. If the vulnerable value is submitted on one page and rendered on another page, use url for the submission endpoint and verification_url for the page that displays the database-backed result.
 - For database_risk_scan blind SQL injection validation, keep confirm_time_based enabled unless the user asks for the lightest possible scan. Confirmation alternates normal and delayed probes to reduce false positives and must not extract database data.
@@ -1282,7 +1582,8 @@ async fn complete(
         request = request.with_max_tokens(max_tokens);
     }
 
-    let response = client.complete(request).await?;
+    let on_delta: CompletionDeltaCallback = Arc::new(|_| {});
+    let response = client.complete_streaming(request, on_delta).await?;
     Ok(response.content)
 }
 
@@ -1293,6 +1594,48 @@ async fn complete_with_thinking(
     max_tokens: Option<u32>,
 ) -> anyhow::Result<String> {
     render_ai_spinner_until(complete(client, messages, temperature, max_tokens)).await
+}
+
+async fn complete_with_thinking_retrying_temperature(
+    client: &dyn LlmClient,
+    messages: &[ChatMessage],
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> anyhow::Result<String> {
+    let result = complete_with_thinking(client, messages, temperature, max_tokens).await;
+    match result {
+        Err(error)
+            if temperature.is_some()
+                && error
+                    .downcast_ref::<crate::llm::LlmError>()
+                    .is_some_and(|llm_error| {
+                        client.should_retry_without_temperature(llm_error)
+                    }) =>
+        {
+            complete_with_thinking(client, messages, None, max_tokens).await
+        }
+        other => other,
+    }
+}
+
+async fn complete_agent_turn_retrying_temperature(
+    client: &dyn LlmClient,
+    request: AgentTurnRequest,
+    on_delta: CompletionDeltaCallback,
+) -> anyhow::Result<AgentTurnResponse> {
+    let result = client
+        .complete_agent_turn(request.clone(), Arc::clone(&on_delta))
+        .await;
+    match result {
+        Err(error)
+            if request.temperature.is_some() && client.should_retry_without_temperature(&error) =>
+        {
+            let mut retry_request = request;
+            retry_request.temperature = None;
+            Ok(client.complete_agent_turn(retry_request, on_delta).await?)
+        }
+        other => Ok(other?),
+    }
 }
 
 fn copy_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -1467,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_agent_tool_call_decision() {
+    fn parses_json_agent_tool_call_decision() {
         let decision = parse_agent_decision(
             r#"{"action":"call_tool","tool_name":"database_risk_scan","input":{"url":"http://localhost/test?date=2026-05-13","method":"GET"}}"#,
         )
@@ -1483,7 +1826,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_agent_decision_inside_text() {
+    fn parses_json_final_decision() {
+        let decision = parse_agent_decision(
+            r#"{"action":"final","message":"你好，我是 Safety Protection Agent。"}"#,
+        )
+        .expect("final decision should parse");
+
+        match decision {
+            AgentDecision::Final { message } => {
+                assert_eq!(message, "你好，我是 Safety Protection Agent。");
+            }
+            _ => panic!("expected final"),
+        }
+    }
+
+    #[test]
+    fn parses_json_ask_inside_text() {
         let decision = parse_agent_decision(
             "```json\n{\"action\":\"ask\",\"message\":\"请提供 HTTP 方法和参数。\"}\n```",
         )
@@ -1515,15 +1873,12 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
     }
 
     #[test]
-    fn completion_confirmation_prompt_requires_explicit_done_or_continue() {
-        let prompt =
-            format_completion_confirmation_prompt("final", "扫描结果看起来没问题。", false);
+    fn missing_decision_prompt_requires_json_fallback_protocol() {
+        let prompt = format_missing_decision_prompt("扫描结果看起来没问题。");
 
-        assert!(prompt.contains("completion check"));
         assert!(prompt.contains("\"action\":\"final\""));
         assert!(prompt.contains("\"action\":\"ask\""));
         assert!(prompt.contains("\"action\":\"call_tool\""));
-        assert!(prompt.contains("If more work can still be done"));
         assert!(prompt.contains("扫描结果看起来没问题。"));
     }
 
@@ -1541,17 +1896,9 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
     }
 
     #[test]
-    fn visible_model_message_matching_uses_trimmed_text() {
-        let displayed = Some("阶段性分析完成。".to_string());
-
-        assert!(was_visible_model_message_already_displayed(
-            &displayed,
-            "  阶段性分析完成。\n"
-        ));
-        assert!(!was_visible_model_message_already_displayed(
-            &displayed,
-            "最终分析完成。"
-        ));
+    fn repl_prompt_labels_user_input() {
+        assert_eq!(USER_PROMPT, "user> ");
+        assert_eq!(AGENT_PREFIX, "agent> ");
     }
 
     #[test]
@@ -1567,7 +1914,6 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
         assert!(prompt.contains("1.get 2.date=2026-05-13"));
         assert!(prompt.contains("\"action\":\"call_tool\""));
         assert!(prompt.contains("Remote MCP status"));
-        assert!(prompt.contains("completion check"));
         assert!(prompt.contains("body_format \"form\""));
         assert!(prompt.contains("verification_url"));
         assert!(prompt.contains("confirm_time_based"));
@@ -1576,5 +1922,20 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
         assert!(prompt.contains("sample_coverage"));
         assert!(prompt.contains("attack_types"));
         assert!(prompt.contains("remediation"));
+    }
+
+    #[test]
+    fn native_prompt_uses_native_tools_without_sentinel_protocol() {
+        let tools = vec![ToolSpec::new(
+            "database_risk_scan",
+            "Probe database risk.",
+            json!({"type":"object","required":["url"]}),
+        )];
+        let prompt = format_native_agent_loop_system_prompt(&tools, &RemoteMcpToolbox::empty());
+
+        assert!(prompt.contains("native tool calls"));
+        assert!(prompt.contains("database_risk_scan"));
+        assert!(!prompt.contains("SPA_DONE"));
+        assert!(!prompt.contains("\"action\":\"call_tool\""));
     }
 }

@@ -4,6 +4,7 @@ mod gemini;
 mod ollama;
 mod openai_compatible;
 mod openai_responses;
+mod sse;
 
 use super::{LlmClient, LlmConfig, ProviderKind, Result};
 

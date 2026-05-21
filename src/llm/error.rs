@@ -10,6 +10,9 @@ pub enum LlmError {
     #[error("unsupported LLM provider: {0}")]
     UnsupportedProvider(String),
 
+    #[error("LLM provider does not support native tool calls")]
+    UnsupportedNativeTools,
+
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
 
