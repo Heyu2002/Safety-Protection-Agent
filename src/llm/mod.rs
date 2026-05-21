@@ -6,8 +6,8 @@ mod types;
 pub use config::{LlmConfig, ProviderKind};
 pub use error::{LlmError, Result};
 pub use types::{
-    AgentToolCall, AgentToolSpec, AgentTurnRequest, AgentTurnResponse, ChatMessage, ChatRole,
-    ChatUsage, CompletionRequest, CompletionResponse,
+    AgentToolCall, AgentToolSpec, AgentToolTranscriptItem, AgentTurnRequest, AgentTurnResponse,
+    ChatMessage, ChatRole, ChatUsage, CompletionRequest, CompletionResponse,
 };
 
 use async_trait::async_trait;

@@ -5,9 +5,9 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::llm::{
-    AgentToolCall, AgentToolSpec, AgentTurnRequest, AgentTurnResponse, ChatUsage,
-    CompletionDeltaCallback, CompletionRequest, CompletionResponse, LlmClient, LlmConfig, LlmError,
-    Result,
+    AgentToolCall, AgentToolSpec, AgentToolTranscriptItem, AgentTurnRequest, AgentTurnResponse,
+    ChatUsage, CompletionDeltaCallback, CompletionRequest, CompletionResponse, LlmClient,
+    LlmConfig, LlmError, Result,
 };
 
 use super::sse::SseDecoder;
@@ -196,32 +196,31 @@ fn chat_agent_messages(request: &AgentTurnRequest) -> Vec<Value> {
     }
 
     for item in &request.input_items {
-        match item.get("type").and_then(Value::as_str) {
-            Some("function_call") => messages.push(chat_assistant_tool_call_message(item)),
-            Some("function_call_output") => messages.push(json!({
+        match item {
+            AgentToolTranscriptItem::ToolCall { .. } => {
+                messages.push(chat_assistant_tool_call_message(item));
+            }
+            AgentToolTranscriptItem::ToolResult { call_id, output } => messages.push(json!({
                 "role": "tool",
-                "tool_call_id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
-                "content": item.get("output").and_then(Value::as_str).unwrap_or_default(),
+                "tool_call_id": call_id,
+                "content": output,
             })),
-            _ => {}
         }
     }
 
     messages
 }
 
-fn chat_assistant_tool_call_message(item: &Value) -> Value {
-    let call_id = item
-        .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-    let arguments = item
-        .get("arguments")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| "{}".to_owned());
+fn chat_assistant_tool_call_message(item: &AgentToolTranscriptItem) -> Value {
+    let AgentToolTranscriptItem::ToolCall {
+        call_id,
+        name,
+        input,
+    } = item
+    else {
+        unreachable!("chat assistant tool-call message requires a tool-call item");
+    };
+    let arguments = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_owned());
 
     json!({
         "role": "assistant",
@@ -436,14 +435,8 @@ impl PartialChatToolCall {
     }
 }
 
-fn chat_tool_call_to_response_item(tool_call: &AgentToolCall) -> Value {
-    json!({
-        "type": "function_call",
-        "id": tool_call.id,
-        "call_id": tool_call.call_id,
-        "name": tool_call.name,
-        "arguments": serde_json::to_string(&tool_call.input).unwrap_or_else(|_| "{}".to_owned()),
-    })
+fn chat_tool_call_to_response_item(tool_call: &AgentToolCall) -> AgentToolTranscriptItem {
+    AgentToolTranscriptItem::tool_call(tool_call)
 }
 
 fn merge_non_streaming_tool_calls_from_content(
@@ -562,17 +555,12 @@ mod tests {
     #[test]
     fn converts_function_outputs_back_to_chat_tool_messages() {
         let request = AgentTurnRequest::new(Vec::new(), Vec::new()).with_input_items(vec![
-            json!({
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "echo",
-                "arguments": "{\"text\":\"hi\"}"
-            }),
-            json!({
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "hi"
-            }),
+            AgentToolTranscriptItem::ToolCall {
+                call_id: "call_1".to_owned(),
+                name: "echo".to_owned(),
+                input: json!({ "text": "hi" }),
+            },
+            AgentToolTranscriptItem::tool_result("call_1", "hi"),
         ]);
 
         let messages = chat_agent_messages(&request);

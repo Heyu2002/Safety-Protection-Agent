@@ -6,8 +6,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::llm::{
-    AgentToolCall, AgentToolSpec, AgentTurnRequest, AgentTurnResponse, CompletionDeltaCallback,
-    CompletionRequest, CompletionResponse, LlmClient, LlmConfig, LlmError, Result,
+    AgentToolCall, AgentToolSpec, AgentToolTranscriptItem, AgentTurnRequest, AgentTurnResponse,
+    CompletionDeltaCallback, CompletionRequest, CompletionResponse, LlmClient, LlmConfig, LlmError,
+    Result,
 };
 
 use super::sse::SseDecoder;
@@ -187,7 +188,7 @@ fn codex_agent_body(model: &str, request: &AgentTurnRequest) -> Value {
 
 fn codex_input(
     messages: &[crate::llm::ChatMessage],
-    input_items: &[Value],
+    input_items: &[AgentToolTranscriptItem],
 ) -> (String, Vec<Value>) {
     let mut instructions = Vec::new();
     let mut input = Vec::new();
@@ -206,8 +207,28 @@ fn codex_input(
         }
     }
 
-    input.extend(input_items.iter().cloned());
+    input.extend(input_items.iter().map(codex_tool_transcript_item));
     (instructions.join("\n\n"), input)
+}
+
+fn codex_tool_transcript_item(item: &AgentToolTranscriptItem) -> Value {
+    match item {
+        AgentToolTranscriptItem::ToolCall {
+            call_id,
+            name,
+            input,
+        } => json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".to_owned()),
+        }),
+        AgentToolTranscriptItem::ToolResult { call_id, output } => json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        }),
+    }
 }
 
 fn response_tools(tools: &[AgentToolSpec]) -> Vec<Value> {
@@ -365,7 +386,7 @@ async fn read_agent_responses_sse(
 fn collect_agent_event(
     data: &str,
     content: &mut String,
-    output_items: &mut Vec<Value>,
+    output_items: &mut Vec<AgentToolTranscriptItem>,
     tool_calls: &mut Vec<AgentToolCall>,
     on_delta: &CompletionDeltaCallback,
 ) {
@@ -397,13 +418,12 @@ fn collect_agent_event(
 
 fn collect_response_items(
     response: &Value,
-    output_items: &mut Vec<Value>,
+    output_items: &mut Vec<AgentToolTranscriptItem>,
     tool_calls: &mut Vec<AgentToolCall>,
 ) {
     let Some(items) = response.get("output").and_then(Value::as_array) else {
         return;
     };
-    output_items.extend(items.iter().cloned());
 
     for item in items {
         if item.get("type").and_then(Value::as_str) != Some("function_call") {
@@ -424,12 +444,14 @@ fn collect_response_items(
             .unwrap_or(&call_id)
             .to_owned();
         let input = parse_function_arguments(item.get("arguments"));
-        tool_calls.push(AgentToolCall {
+        let tool_call = AgentToolCall {
             id,
             call_id,
             name: name.to_owned(),
             input,
-        });
+        };
+        output_items.push(AgentToolTranscriptItem::tool_call(&tool_call));
+        tool_calls.push(tool_call);
     }
 }
 
@@ -455,5 +477,49 @@ fn collect_text_from_response(response: &Value, output: &mut String) {
                 output.push_str(text);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn response_transcript_keeps_only_tool_calls() {
+        let response = json!({
+            "output": [
+                { "type": "reasoning", "id": "rs_not_persisted" },
+                {
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "thinking done" }]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                }
+            ]
+        });
+        let mut output_items = Vec::new();
+        let mut tool_calls = Vec::new();
+
+        collect_response_items(&response, &mut output_items, &mut tool_calls);
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].call_id, "call_1");
+        assert_eq!(tool_calls[0].name, "echo");
+        assert_eq!(tool_calls[0].input, json!({ "text": "hi" }));
+        assert_eq!(
+            output_items,
+            vec![AgentToolTranscriptItem::ToolCall {
+                call_id: "call_1".to_owned(),
+                name: "echo".to_owned(),
+                input: json!({ "text": "hi" }),
+            }]
+        );
     }
 }

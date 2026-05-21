@@ -7,6 +7,7 @@ use crossterm::terminal::{self, Clear, ClearType};
 use std::collections::HashSet;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time;
@@ -16,8 +17,9 @@ use crate::agent::prompt::{
     COMPACT_SYSTEM_PROMPT, COMPACTED_CONTEXT_PREFIX, default_system_prompt,
 };
 use crate::llm::{
-    AgentToolCall, AgentToolSpec, AgentTurnRequest, AgentTurnResponse, ChatMessage, ChatRole,
-    CompletionDeltaCallback, CompletionRequest, LlmClient, LlmConfig, client_from_config,
+    AgentToolCall, AgentToolSpec, AgentToolTranscriptItem, AgentTurnRequest, AgentTurnResponse,
+    ChatMessage, ChatRole, CompletionDeltaCallback, CompletionRequest, LlmClient, LlmConfig,
+    client_from_config,
 };
 use crate::mcp_client::RemoteMcpToolbox;
 use crate::mcp_client::{
@@ -808,7 +810,10 @@ async fn run_agent_loop(
     let registry = ToolRegistry::with_builtins()?;
     let remote_mcp_configs = load_remote_mcp_configs().unwrap_or_default();
     let mut remote_mcp = LazyRemoteMcp::new(remote_mcp_configs);
-    let tools = registry.specs();
+    if should_eager_connect_mcp(prompt) {
+        let _ = remote_mcp.connect_if_needed().await;
+    }
+    let tools = combined_tool_specs(&registry, remote_mcp.status());
 
     let response = if client.supports_native_tools() {
         run_native_agent_loop(
@@ -838,6 +843,21 @@ async fn run_agent_loop(
 
     remote_mcp.shutdown().await;
     response
+}
+
+fn combined_tool_specs(registry: &ToolRegistry, remote_mcp: &RemoteMcpToolbox) -> Vec<ToolSpec> {
+    let mut tools = registry.specs();
+    tools.extend(remote_mcp.specs());
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools
+}
+
+fn should_eager_connect_mcp(prompt: &str) -> bool {
+    let prompt = prompt.to_ascii_lowercase();
+    ["mcp", "chrome", "devtools", "browser"]
+        .iter()
+        .any(|keyword| prompt.contains(keyword))
+        || prompt.contains("浏览器")
 }
 
 async fn run_fallback_agent_loop(
@@ -912,7 +932,8 @@ async fn run_fallback_agent_loop(
                         .await
                         .map_err(anyhow::Error::from)?
                 } else {
-                    remote_mcp.call(&tool_name, input).await?
+                    render_tool_spinner_until(&tool_name, remote_mcp.call(&tool_name, input))
+                        .await?
                 };
 
                 loop_messages.push(ChatMessage::assistant(raw));
@@ -953,6 +974,8 @@ async fn run_native_agent_loop(
         }
 
         let displayed_before = renderer.delta_count();
+        let spinner = SpinnerHandle::start("thinking");
+        renderer.set_spinner(spinner.clone());
         let renderer_state = renderer.shared_state();
         let on_delta: CompletionDeltaCallback = Arc::new(move |delta| {
             if let Ok(mut state) = renderer_state.lock() {
@@ -960,6 +983,8 @@ async fn run_native_agent_loop(
             }
         });
         let turn = complete_agent_turn_retrying_temperature(client, request, on_delta).await?;
+        spinner.stop();
+        renderer.clear_spinner();
         renderer.finish_message();
         let final_turn_displayed = renderer.delta_count() > displayed_before;
 
@@ -994,11 +1019,10 @@ async fn run_native_agent_loop(
             } else {
                 execute_agent_tool_call(registry, remote_mcp, &tool_call).await?
             };
-            input_items.push(json!({
-                "type": "function_call_output",
-                "call_id": tool_call.call_id,
-                "output": output,
-            }));
+            input_items.push(AgentToolTranscriptItem::tool_result(
+                tool_call.call_id,
+                output,
+            ));
         }
     }
 }
@@ -1020,9 +1044,11 @@ async fn execute_agent_tool_call(
         .await
         .map_err(anyhow::Error::from)?
     } else {
-        remote_mcp
-            .call(&tool_call.name, tool_call.input.clone())
-            .await?
+        render_tool_spinner_until(
+            &tool_call.name,
+            remote_mcp.call(&tool_call.name, tool_call.input.clone()),
+        )
+        .await?
     };
 
     Ok(format_tool_result_for_agent(&tool_call.name, &output))
@@ -1102,6 +1128,18 @@ impl StreamingAgentRenderer {
         Arc::clone(&self.state)
     }
 
+    fn set_spinner(&self, spinner: SpinnerHandle) {
+        if let Ok(mut state) = self.state.lock() {
+            state.set_spinner(spinner);
+        }
+    }
+
+    fn clear_spinner(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.clear_spinner();
+        }
+    }
+
     fn finish_message(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.finish_message();
@@ -1120,9 +1158,21 @@ impl StreamingAgentRenderer {
 struct StreamingAgentRendererState {
     active_message: bool,
     delta_count: usize,
+    spinner: Option<SpinnerHandle>,
 }
 
 impl StreamingAgentRendererState {
+    fn set_spinner(&mut self, spinner: SpinnerHandle) {
+        self.clear_spinner();
+        self.spinner = Some(spinner);
+    }
+
+    fn clear_spinner(&mut self) {
+        if let Some(spinner) = self.spinner.take() {
+            spinner.stop();
+        }
+    }
+
     fn render_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
@@ -1130,6 +1180,7 @@ impl StreamingAgentRendererState {
 
         let mut stdout = std::io::stdout();
         if !self.active_message {
+            self.clear_spinner();
             let _ = queue!(
                 stdout,
                 SetForegroundColor(AGENT_PROMPT_COLOR),
@@ -1236,7 +1287,12 @@ fn render_tool_progress(progress: &crate::tools::ToolProgress, state: &mut Progr
 }
 
 fn format_percent_progress_line(progress: &crate::tools::ToolProgress) -> String {
-    format!("进度: {}% - {}", progress.percent, progress.message)
+    format!(
+        "{} 进度: {}% - {}",
+        top_level_tool_display_name(&progress.tool_name),
+        progress.percent,
+        progress.message
+    )
 }
 
 fn checklist_progress_lines(progress: &crate::tools::ToolProgress) -> Option<Vec<String>> {
@@ -1253,18 +1309,29 @@ fn checklist_progress_lines(progress: &crate::tools::ToolProgress) -> Option<Vec
         rows.push(format!("{marker} {label}"));
     }
 
-    Some(checklist_box_lines(&rows))
+    Some(checklist_box_lines(
+        &rows,
+        &top_level_tool_display_name(&progress.tool_name),
+    ))
 }
 
-fn checklist_box_lines(rows: &[String]) -> Vec<String> {
+fn checklist_box_lines(rows: &[String], title: &str) -> Vec<String> {
     let content_width = rows
         .iter()
         .map(|row| UnicodeWidthStr::width(row.as_str()))
+        .chain(std::iter::once(UnicodeWidthStr::width(title) + 2))
         .max()
         .unwrap_or(0);
     let border = "─".repeat(content_width + 2);
     let mut lines = Vec::with_capacity(rows.len() + 2);
-    lines.push(format!("┌{border}┐"));
+    if title.is_empty() {
+        lines.push(format!("┌{border}┐"));
+    } else {
+        let title = format!(" {title} ");
+        let title_width = UnicodeWidthStr::width(title.as_str());
+        let right_border = "─".repeat((content_width + 2).saturating_sub(title_width));
+        lines.push(format!("┌{title}{right_border}┐"));
+    }
     for row in rows {
         let padding =
             " ".repeat(content_width.saturating_sub(UnicodeWidthStr::width(row.as_str())));
@@ -1305,26 +1372,61 @@ async fn render_ai_spinner_until<F>(future: F) -> anyhow::Result<String>
 where
     F: Future<Output = anyhow::Result<String>>,
 {
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut interval = time::interval(Duration::from_millis(90));
-    let mut index = 0usize;
-    tokio::pin!(future);
+    render_spinner_until("thinking", future).await
+}
 
-    loop {
-        tokio::select! {
-            result = &mut future => {
-                clear_spinner_line();
-                return result;
-            }
-            _ = interval.tick() => {
-                render_spinner_frame(frames[index % frames.len()]);
+async fn render_tool_spinner_until<F, T>(tool_name: &str, future: F) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    let label = top_level_tool_display_name(tool_name);
+    render_spinner_until(&label, future).await
+}
+
+async fn render_spinner_until<F, T>(label: &str, future: F) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    let spinner = SpinnerHandle::start(label);
+    let result = future.await;
+    spinner.stop();
+    result
+}
+
+#[derive(Clone, Debug)]
+struct SpinnerHandle {
+    active: Arc<AtomicBool>,
+}
+
+impl SpinnerHandle {
+    fn start(label: impl Into<String>) -> Self {
+        let label = label.into();
+        let active = Arc::new(AtomicBool::new(true));
+        let task_active = Arc::clone(&active);
+
+        tokio::spawn(async move {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut interval = time::interval(Duration::from_millis(90));
+            let mut index = 0usize;
+
+            while task_active.load(Ordering::SeqCst) {
+                render_spinner_frame(frames[index % frames.len()], &label);
                 index += 1;
+                interval.tick().await;
             }
+        });
+
+        Self { active }
+    }
+
+    fn stop(&self) {
+        if self.active.swap(false, Ordering::SeqCst) {
+            clear_spinner_line();
         }
     }
 }
 
-fn render_spinner_frame(frame: &str) {
+fn render_spinner_frame(frame: &str, label: &str) {
     let mut stdout = std::io::stdout();
     let _ = queue!(
         stdout,
@@ -1336,9 +1438,21 @@ fn render_spinner_frame(frame: &str) {
             b: 0,
         })
     );
-    let _ = write!(stdout, "{frame} thinking");
+    let _ = write!(stdout, "{frame} {label}");
     let _ = queue!(stdout, ResetColor);
     let _ = stdout.flush();
+}
+
+fn top_level_tool_display_name(tool_name: &str) -> String {
+    let mut parts = tool_name.split("__");
+    if parts.next() == Some("mcp")
+        && let Some(server_name) = parts.next()
+        && !server_name.is_empty()
+    {
+        return server_name.to_owned();
+    }
+
+    tool_name.to_owned()
 }
 
 fn clear_spinner_line() {
@@ -1883,22 +1997,47 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
     }
 
     #[test]
-    fn percent_progress_line_hides_internal_tool_name() {
+    fn percent_progress_line_shows_top_level_tool_name() {
         let progress =
             crate::tools::ToolProgress::new("http_load_test", "30/100 requests completed", 30, 100);
 
         let line = format_percent_progress_line(&progress);
 
+        assert!(line.contains("http_load_test"));
         assert!(line.contains("30%"));
         assert!(line.contains("30/100 requests completed"));
-        assert!(!line.contains("http_load_test"));
         assert!(!line.contains("Tool progress"));
+    }
+
+    #[test]
+    fn top_level_tool_display_name_hides_mcp_tool_detail() {
+        assert_eq!(
+            top_level_tool_display_name("mcp__chrome-devtools__click"),
+            "chrome-devtools"
+        );
+        assert_eq!(
+            top_level_tool_display_name("weak_session_id_scan"),
+            "weak_session_id_scan"
+        );
     }
 
     #[test]
     fn repl_prompt_labels_user_input() {
         assert_eq!(USER_PROMPT, "user> ");
         assert_eq!(AGENT_PREFIX, "agent> ");
+    }
+
+    #[test]
+    fn eager_mcp_connect_only_for_explicit_browser_intent() {
+        assert!(should_eager_connect_mcp(
+            "直接使用mcp看chrome，账密是默认账密"
+        ));
+        assert!(should_eager_connect_mcp("用浏览器打开这个靶场"));
+        assert!(should_eager_connect_mcp("inspect with DevTools"));
+        assert!(!should_eager_connect_mcp("你好"));
+        assert!(!should_eager_connect_mcp(
+            "帮我分析这个接口有没有数据库漏洞"
+        ));
     }
 
     #[test]

@@ -118,7 +118,7 @@ impl AgentToolSpec {
 #[derive(Debug, Clone)]
 pub struct AgentTurnRequest {
     pub messages: Vec<ChatMessage>,
-    pub input_items: Vec<Value>,
+    pub input_items: Vec<AgentToolTranscriptItem>,
     pub tools: Vec<AgentToolSpec>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
@@ -135,7 +135,7 @@ impl AgentTurnRequest {
         }
     }
 
-    pub fn with_input_items(mut self, input_items: Vec<Value>) -> Self {
+    pub fn with_input_items(mut self, input_items: Vec<AgentToolTranscriptItem>) -> Self {
         self.input_items = input_items;
         self
     }
@@ -159,11 +159,41 @@ pub struct AgentToolCall {
     pub input: Value,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentToolTranscriptItem {
+    ToolCall {
+        call_id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        call_id: String,
+        output: String,
+    },
+}
+
+impl AgentToolTranscriptItem {
+    pub fn tool_call(tool_call: &AgentToolCall) -> Self {
+        Self::ToolCall {
+            call_id: tool_call.call_id.clone(),
+            name: tool_call.name.clone(),
+            input: tool_call.input.clone(),
+        }
+    }
+
+    pub fn tool_result(call_id: impl Into<String>, output: impl Into<String>) -> Self {
+        Self::ToolResult {
+            call_id: call_id.into(),
+            output: output.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentTurnResponse {
     pub content: String,
     pub tool_calls: Vec<AgentToolCall>,
-    pub output_items: Vec<Value>,
+    pub output_items: Vec<AgentToolTranscriptItem>,
     pub model: String,
     pub usage: Option<ChatUsage>,
 }
