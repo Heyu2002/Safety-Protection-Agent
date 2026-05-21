@@ -174,6 +174,29 @@ mcp__chrome-devtools__take_snapshot
 MCP servers are lazy-connected: a regular prompt such as `你好` will not start
 Chrome or any other MCP process.
 
+### Recommended MCP Servers
+
+Use `spa mcp add <name> -- <command> [args...]` to register MCP servers. The
+part before `--` is SPA's local server name; everything after `--` is the
+command SPA will run when the agent actually needs that MCP server.
+
+First recommended server:
+
+| MCP server | Why install it | Install |
+| --- | --- | --- |
+| Chrome DevTools for agents | Lets the agent inspect, navigate, snapshot, and interact with authorized web targets through Chrome DevTools. Useful for web security labs, login flows, UI state, and browser-observed evidence. | `spa mcp add chrome-devtools -- npx chrome-devtools-mcp@latest --isolated --no-usage-statistics` |
+
+After installing:
+
+```powershell
+spa mcp list
+spa
+```
+
+Then use `/mcp` inside the REPL to confirm the configured server name. Listing
+servers does not start Chrome; Chrome DevTools MCP starts lazily when the agent
+calls one of its remote tools.
+
 SPA can also run as an MCP server:
 
 ```powershell

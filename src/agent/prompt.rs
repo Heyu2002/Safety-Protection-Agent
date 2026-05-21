@@ -19,7 +19,18 @@ mod tests {
         assert!(DEFAULT_SYSTEM_PROMPT.contains("Safety Protection Agent"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("defensive"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("authorized red-team validation"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("actively validating"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("network attack surfaces"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("publicly disclosed vulnerabilities"));
+    }
+
+    #[test]
+    fn default_prompt_defines_authorized_offensive_validation_posture() {
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("# Authorized Offensive Validation Posture"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("proactive and adversarial"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("attack surface"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("low-impact probes"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("exploitability"));
     }
 
     #[test]
