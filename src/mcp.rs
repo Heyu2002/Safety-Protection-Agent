@@ -15,8 +15,31 @@ use crate::tools::{ToolCall, ToolRegistry, ToolSpec};
 
 const SERVER_NAME: &str = "safety-protection-agent-mcp";
 
+pub struct McpServerOptions {
+    pub name: String,
+    pub title: String,
+    pub instructions: String,
+}
+
 pub async fn run_stdio() -> anyhow::Result<()> {
     let registry = ToolRegistry::with_builtins()?;
+    run_stdio_with_registry(
+        registry,
+        McpServerOptions {
+            name: SERVER_NAME.to_owned(),
+            title: "Safety Protection Agent".to_owned(),
+            instructions:
+                "Tools are defensive security and reliability probes. Ask for missing request details before calling tools."
+                    .to_owned(),
+        },
+    )
+    .await
+}
+
+pub async fn run_stdio_with_registry(
+    registry: ToolRegistry,
+    options: McpServerOptions,
+) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = io::stdout();
@@ -41,7 +64,8 @@ pub async fn run_stdio() -> anyhow::Result<()> {
 
         match message {
             ClientJsonRpcMessage::Request(request) => {
-                process_request(&mut stdout, &registry, &mut initialized, request).await?;
+                process_request(&mut stdout, &registry, &options, &mut initialized, request)
+                    .await?;
             }
             ClientJsonRpcMessage::Notification(notification) => {
                 process_notification(notification);
@@ -56,6 +80,7 @@ pub async fn run_stdio() -> anyhow::Result<()> {
 async fn process_request(
     stdout: &mut io::Stdout,
     registry: &ToolRegistry,
+    options: &McpServerOptions,
     initialized: &mut bool,
     request: JsonRpcRequest<ClientRequest>,
 ) -> anyhow::Result<()> {
@@ -73,8 +98,8 @@ async fn process_request(
             }
 
             let server_info = Implementation {
-                name: SERVER_NAME.to_owned(),
-                title: Some("Safety Protection Agent".to_owned()),
+                name: options.name.clone(),
+                title: Some(options.title.clone()),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 description: None,
                 icons: None,
@@ -87,10 +112,7 @@ async fn process_request(
                     }),
                     ..Default::default()
                 },
-                instructions: Some(
-                    "Tools are defensive security and reliability probes. Ask for missing request details before calling tools."
-                        .to_owned(),
-                ),
+                instructions: Some(options.instructions.clone()),
                 protocol_version: params.params.protocol_version,
                 server_info,
             };

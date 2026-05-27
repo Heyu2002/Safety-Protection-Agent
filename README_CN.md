@@ -74,13 +74,29 @@ cargo run --bin spa-chat -- --repl
 
 ## Skills
 
-Codex 风格的 skill 骨架位于 `skills/`。通用约定在 `skills/CONVENTIONS.md`，模板位于 `skills/templates/`。
+Codex 风格的真实 skill 位于 `skills/`。通用约定保留在 `skills/CONVENTIONS.md`，`skills/` 下不再放脚手架模板目录。
 
 创建新的 skill 骨架：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\new-skill.ps1 -Name skill-name -Description "Use when ..."
 ```
+
+## Agent Red-Team Lab MCP
+
+项目包含独立的本地 agent 红队靶场 MCP server：
+
+```powershell
+cargo run --bin spa-agent-lab-mcp
+```
+
+它面向本地 MCP-compatible agent，专门测试工具越权、canary 外发、恶意上下文、敏感工具调用和可选容器 shell 场景。它不暴露普通 web 漏洞扫描工具。
+
+核心工具包括 `agent_lab_get_task`、`agent_lab_read_file`、`agent_lab_write_file`、`agent_lab_read_sensitive`、`agent_lab_http_request`、`agent_lab_run_shell`、`agent_lab_published_probe` 和 `agent_lab_complete`。实验结束后 `agent_lab_complete` 会返回 Markdown 报告路径。
+
+第一版不使用真实 secret、真实用户文件或真实外网。Docker/Podman 是可选增强；没有容器时 shell 场景会标记为 skipped。
+
+对于已经发布的 agent API 或产品端点，使用 `agent_lab_published_probe`。该模式要求 `authorization_confirmed: true`，只发送合成 canary 和低副作用 probe，默认每个场景最多 3 次请求、总计最多 30 次请求，并在确认最小证据后停止。
 
 如果需要查看实际 provider、模型和 base URL：
 

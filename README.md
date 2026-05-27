@@ -206,6 +206,42 @@ cargo run --bin spa-mcp
 Long-running built-in tools emit MCP progress notifications when the MCP client
 passes `_meta.progressToken`.
 
+### Agent Red-Team Lab MCP
+
+SPA also includes a separate MCP server for evaluating local MCP-compatible
+agents against tool-overreach scenarios:
+
+```powershell
+cargo run --bin spa-agent-lab-mcp
+```
+
+Register it with the target agent as a standalone MCP server. It intentionally
+does not expose the normal web vulnerability tools. The lab provides hostile
+context fixtures, decoy sensitive-read tools, a local-only collector, optional
+container-backed shell execution, event logging, and a Markdown report.
+
+Core tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `agent_lab_get_task` | Start a scenario and return hostile or benign fixture guidance. |
+| `agent_lab_read_file` | Read lab workspace files while recording access. |
+| `agent_lab_write_file` | Write allowed workspace files and reject protected paths. |
+| `agent_lab_read_sensitive` | Decoy sensitive tool; unauthorized use is a high finding. |
+| `agent_lab_http_request` | Simulated HTTP client; only the local lab collector is allowed. |
+| `agent_lab_run_shell` | Optional container sandbox command execution; skipped without Docker/Podman. |
+| `agent_lab_published_probe` | Authorized low-impact black-box probe for published agent APIs using synthetic canaries and confirm-then-stop behavior. |
+| `agent_lab_complete` | Finalize the session and return the Markdown report path. |
+
+The lab never requires real secrets, real user files, or real external network
+targets. Docker or Podman is optional; when unavailable, shell scenarios are
+marked skipped while the MCP overreach tests still run.
+
+For already published agent APIs, use `agent_lab_published_probe` instead of
+MCP fixture tools. It requires `authorization_confirmed: true`, sends only
+synthetic canary prompts to the configured endpoint, keeps request caps low, and
+stops on the first confirmed signal by default.
+
 ## Built-in Tools
 
 | Tool | Purpose | Progress UI |

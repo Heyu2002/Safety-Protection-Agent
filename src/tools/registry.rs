@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use super::{
     DatabaseRiskScanTool, EchoTool, HttpLoadTestTool, HttpSecurityHeadersScanTool, Result,
     ToolCall, ToolError, ToolOutput, ToolProgressCallback, ToolSpec, WeakSessionIdScanTool,
+    XssRiskScanTool,
 };
 
 #[async_trait]
@@ -49,7 +50,8 @@ impl ToolRegistry {
             .register(HttpLoadTestTool)?
             .register(HttpSecurityHeadersScanTool)?
             .register(DatabaseRiskScanTool)?
-            .register(WeakSessionIdScanTool)
+            .register(WeakSessionIdScanTool)?
+            .register(XssRiskScanTool)
             .map(ToolRegistryBuilder::build)
     }
 

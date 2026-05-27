@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_lab;
 pub mod cli;
 pub mod llm;
 pub mod mcp;

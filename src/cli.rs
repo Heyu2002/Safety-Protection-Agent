@@ -5,8 +5,10 @@ use crossterm::queue;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType};
 use std::collections::HashSet;
+use std::fs;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -814,6 +816,7 @@ async fn run_agent_loop(
         let _ = remote_mcp.connect_if_needed().await;
     }
     let tools = combined_tool_specs(&registry, remote_mcp.status());
+    let active_skill_context = load_active_skill_context(prompt).unwrap_or_default();
 
     let response = if client.supports_native_tools() {
         run_native_agent_loop(
@@ -825,6 +828,7 @@ async fn run_agent_loop(
             &registry,
             &mut remote_mcp,
             &tools,
+            &active_skill_context,
         )
         .await
     } else {
@@ -837,6 +841,7 @@ async fn run_agent_loop(
             &registry,
             &mut remote_mcp,
             &tools,
+            &active_skill_context,
         )
         .await
     };
@@ -860,6 +865,198 @@ fn should_eager_connect_mcp(prompt: &str) -> bool {
         || prompt.contains("浏览器")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSkill {
+    name: String,
+    description: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeSkillFrontmatter {
+    name: String,
+    description: String,
+}
+
+fn load_active_skill_context(prompt: &str) -> anyhow::Result<String> {
+    let Some(root) = find_skills_root() else {
+        return Ok(String::new());
+    };
+    let mut skills = Vec::new();
+
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let skill_path = entry.path().join("SKILL.md");
+        if !skill_path.is_file() {
+            continue;
+        }
+        let raw = fs::read_to_string(skill_path)?;
+        let Some(skill) = parse_runtime_skill(&raw) else {
+            continue;
+        };
+        if runtime_skill_matches(prompt, &skill) {
+            skills.push(skill);
+        }
+    }
+
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(format_active_skill_context(&skills))
+}
+
+fn find_skills_root() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join("skills");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn parse_runtime_skill(raw: &str) -> Option<RuntimeSkill> {
+    let (frontmatter, body) = split_markdown_frontmatter(raw)?;
+    let frontmatter = serde_yml::from_str::<RuntimeSkillFrontmatter>(frontmatter).ok()?;
+    let name = frontmatter.name.trim().to_owned();
+    let description = frontmatter.description.trim().to_owned();
+
+    if !is_valid_skill_name(&name) || description.is_empty() {
+        return None;
+    }
+
+    Some(RuntimeSkill {
+        name,
+        description,
+        body: body.trim().to_owned(),
+    })
+}
+
+fn split_markdown_frontmatter(raw: &str) -> Option<(&str, &str)> {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let raw = raw
+        .strip_prefix("---\r\n")
+        .or_else(|| raw.strip_prefix("---\n"))?;
+    let mut offset = 0;
+
+    for line in raw.split_inclusive('\n') {
+        let marker = line.trim_end_matches(&['\r', '\n'][..]);
+        if marker == "---" {
+            let body_start = offset + line.len();
+            return Some((&raw[..offset], &raw[body_start..]));
+        }
+        offset += line.len();
+    }
+
+    let marker = raw[offset..].trim_end_matches('\r');
+    (marker == "---").then_some((&raw[..offset], ""))
+}
+
+fn is_valid_skill_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    if bytes.first() == Some(&b'-') || bytes.last() == Some(&b'-') {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn runtime_skill_matches(prompt: &str, skill: &RuntimeSkill) -> bool {
+    let prompt_lower = prompt.to_lowercase();
+    if prompt_lower.contains(&format!("${}", skill.name))
+        || prompt_lower.contains(&skill.name)
+        || prompt_lower.contains(&skill.name.replace('-', " "))
+    {
+        return true;
+    }
+
+    if skill.name == "web-vulnerability-discovery" && has_web_vulnerability_intent(prompt) {
+        return true;
+    }
+
+    let prompt_tokens = ascii_tokens(prompt);
+    if prompt_tokens.is_empty() {
+        return false;
+    }
+    let description_tokens = ascii_tokens(&skill.description);
+    prompt_tokens
+        .intersection(&description_tokens)
+        .take(2)
+        .count()
+        >= 2
+}
+
+fn has_web_vulnerability_intent(prompt: &str) -> bool {
+    let prompt = prompt.to_lowercase();
+    let web_signal = [
+        "http://",
+        "https://",
+        "web",
+        "site",
+        "url",
+        "网站",
+        "网页",
+        "页面",
+        "靶场",
+        "浏览器",
+    ]
+    .iter()
+    .any(|needle| prompt.contains(needle));
+    let vulnerability_signal = [
+        "vulnerability",
+        "vuln",
+        "security",
+        "xss",
+        "sqli",
+        "session",
+        "redirect",
+        "漏洞",
+        "攻击",
+        "风险",
+        "探测",
+        "挖掘",
+        "测试",
+        "注入",
+        "弱点",
+    ]
+    .iter()
+    .any(|needle| prompt.contains(needle));
+
+    web_signal && vulnerability_signal
+}
+
+fn ascii_tokens(text: &str) -> HashSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            let token = token.to_ascii_lowercase();
+            (token.len() >= 4).then_some(token)
+        })
+        .collect()
+}
+
+fn format_active_skill_context(skills: &[RuntimeSkill]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("# Active Skills\n\n");
+    for skill in skills {
+        output.push_str(&format!(
+            "## ${}\n\nDescription: {}\n\n{}\n\n",
+            skill.name, skill.description, skill.body
+        ));
+    }
+    output.trim().to_owned()
+}
+
 async fn run_fallback_agent_loop(
     client: &dyn LlmClient,
     history: &[ChatMessage],
@@ -869,8 +1066,15 @@ async fn run_fallback_agent_loop(
     registry: &ToolRegistry,
     remote_mcp: &mut LazyRemoteMcp,
     tools: &[ToolSpec],
+    active_skill_context: &str,
 ) -> anyhow::Result<AgentLoopResponse> {
-    let mut loop_messages = build_agent_messages(history, prompt, tools, remote_mcp.status());
+    let mut loop_messages = build_agent_messages(
+        history,
+        prompt,
+        tools,
+        remote_mcp.status(),
+        active_skill_context,
+    );
     let mut tool_call_signatures = HashSet::new();
 
     loop {
@@ -954,8 +1158,15 @@ async fn run_native_agent_loop(
     registry: &ToolRegistry,
     remote_mcp: &mut LazyRemoteMcp,
     tools: &[ToolSpec],
+    active_skill_context: &str,
 ) -> anyhow::Result<AgentLoopResponse> {
-    let messages = build_native_agent_messages(history, prompt, tools, remote_mcp.status());
+    let messages = build_native_agent_messages(
+        history,
+        prompt,
+        tools,
+        remote_mcp.status(),
+        active_skill_context,
+    );
     let native_tools: Vec<AgentToolSpec> =
         tools.iter().map(agent_tool_spec_from_tool_spec).collect();
     let mut input_items = Vec::new();
@@ -1479,9 +1690,12 @@ fn build_agent_messages(
     prompt: &str,
     tools: &[ToolSpec],
     remote_mcp: &RemoteMcpToolbox,
+    active_skill_context: &str,
 ) -> Vec<ChatMessage> {
     let mut messages = vec![ChatMessage::system(format_agent_loop_system_prompt(
-        tools, remote_mcp,
+        tools,
+        remote_mcp,
+        active_skill_context,
     ))];
     messages.extend(history.iter().map(copy_message));
     messages.push(ChatMessage::user(prompt));
@@ -1493,9 +1707,12 @@ fn build_native_agent_messages(
     prompt: &str,
     tools: &[ToolSpec],
     remote_mcp: &RemoteMcpToolbox,
+    active_skill_context: &str,
 ) -> Vec<ChatMessage> {
     let mut messages = vec![ChatMessage::system(format_native_agent_loop_system_prompt(
-        tools, remote_mcp,
+        tools,
+        remote_mcp,
+        active_skill_context,
     ))];
     messages.extend(history.iter().map(copy_message));
     messages.push(ChatMessage::user(prompt));
@@ -1505,6 +1722,7 @@ fn build_native_agent_messages(
 fn format_native_agent_loop_system_prompt(
     tools: &[ToolSpec],
     remote_mcp: &RemoteMcpToolbox,
+    active_skill_context: &str,
 ) -> String {
     let agent_loop_instructions = format!(
         r#"You are running inside a Codex-style agent loop with native tool calls.
@@ -1530,6 +1748,7 @@ Rules:
 - For database_risk_scan on HTML/PHP forms or DVWA medium/high, use body_format "form" for POST form fields. If the vulnerable value is submitted on one page and rendered on another page, use url for the submission endpoint and verification_url for the page that displays the database-backed result.
 - For database_risk_scan blind SQL injection validation, keep confirm_time_based enabled unless the user asks for the lightest possible scan. Confirmation alternates normal and delayed probes to reduce false positives and must not extract database data.
 - For weak_session_id_scan, sample the endpoint that generates or refreshes the ID. If the user mentions DVWA Weak Session IDs, look for the generated Set-Cookie token, commonly dvwaSession, and use enough samples to detect counters, timestamps, md5(time), and duplicate IDs. Do not attempt session takeover.
+- For xss_risk_scan, do not call it with only a bare URL. It needs at least one testable input point: query params in the URL, query_params, object body fields, or injectable_fields. Use browser/MCP observations first when field names or rendering context are unknown.
 - After a tool result is provided, return a final Chinese analysis for the developer. Do not repeat full JSON.
 - When analyzing any tool result, include the report's three required parts: sample coverage, attack types, and how to fix. If the structured result has sample_coverage, attack_types, or remediation fields, use them directly.
 - For database_risk_scan, prefer GET when the user says get, include query params in the url when supplied, and avoid inventing params.
@@ -1543,10 +1762,19 @@ Rules:
         format_remote_mcp_status(remote_mcp)
     );
 
-    format!("{}\n\n{}", default_system_prompt(), agent_loop_instructions)
+    format!(
+        "{}\n\n{}{}",
+        default_system_prompt(),
+        agent_loop_instructions,
+        format_active_skill_prompt_section(active_skill_context)
+    )
 }
 
-fn format_agent_loop_system_prompt(tools: &[ToolSpec], remote_mcp: &RemoteMcpToolbox) -> String {
+fn format_agent_loop_system_prompt(
+    tools: &[ToolSpec],
+    remote_mcp: &RemoteMcpToolbox,
+    active_skill_context: &str,
+) -> String {
     let agent_loop_instructions = format!(
         r#"You are now running inside an agent loop. You can either answer normally, ask for missing information, or call exactly one local or remote MCP tool.
 
@@ -1577,6 +1805,7 @@ Rules:
 - For database_risk_scan on HTML/PHP forms or DVWA medium/high, use body_format "form" for POST form fields. If the vulnerable value is submitted on one page and rendered on another page, use url for the submission endpoint and verification_url for the page that displays the database-backed result.
 - For database_risk_scan blind SQL injection validation, keep confirm_time_based enabled unless the user asks for the lightest possible scan. Confirmation alternates normal and delayed probes to reduce false positives and must not extract database data.
 - For weak_session_id_scan, sample the endpoint that generates or refreshes the ID. If the user mentions DVWA Weak Session IDs, look for the generated Set-Cookie token, commonly dvwaSession, and use enough samples to detect counters, timestamps, md5(time), and duplicate IDs. Do not attempt session takeover.
+- For xss_risk_scan, do not call it with only a bare URL. It needs at least one testable input point: query params in the URL, query_params, object body fields, or injectable_fields. Use browser/MCP observations first when field names or rendering context are unknown.
 - After a tool result is provided, return a final Chinese analysis for the developer. Do not repeat full JSON.
 - When analyzing any tool result, include the report's three required parts: sample coverage, attack types, and how to fix. If the structured result has sample_coverage, attack_types, or remediation fields, use them directly.
 - For database_risk_scan, prefer GET when the user says get, include query params in the url when supplied, and avoid inventing params.
@@ -1586,7 +1815,23 @@ Rules:
         format_remote_mcp_status(remote_mcp)
     );
 
-    format!("{}\n\n{}", default_system_prompt(), agent_loop_instructions)
+    format!(
+        "{}\n\n{}{}",
+        default_system_prompt(),
+        agent_loop_instructions,
+        format_active_skill_prompt_section(active_skill_context)
+    )
+}
+
+fn format_active_skill_prompt_section(active_skill_context: &str) -> String {
+    if active_skill_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n# Runtime Skill Instructions\n\nThe following skill instructions are active for this user request. Follow them when they are more specific than the general workflow.\n\n{}",
+            active_skill_context.trim()
+        )
+    }
 }
 
 fn format_tools_for_agent(tools: &[ToolSpec]) -> String {
@@ -2041,13 +2286,121 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
     }
 
     #[test]
+    fn parses_runtime_skill_frontmatter_and_body() {
+        let raw = r#"---
+name: web-vulnerability-discovery
+description: Use for website vulnerability discovery.
+---
+
+# Web Vulnerability Discovery
+
+Follow the evidence loop.
+"#;
+
+        let skill = parse_runtime_skill(raw).expect("skill should parse");
+
+        assert_eq!(skill.name, "web-vulnerability-discovery");
+        assert_eq!(
+            skill.description,
+            "Use for website vulnerability discovery."
+        );
+        assert!(skill.body.contains("Follow the evidence loop."));
+    }
+
+    #[test]
+    fn parses_runtime_skill_frontmatter_as_yaml() {
+        let raw = r#"---
+name: web-vulnerability-discovery
+description: "Use when a URL includes https://target.example:8443/path."
+---
+
+Body can contain frontmatter-looking separators.
+
+---
+"#;
+
+        let skill = parse_runtime_skill(raw).expect("skill should parse");
+
+        assert_eq!(skill.name, "web-vulnerability-discovery");
+        assert_eq!(
+            skill.description,
+            "Use when a URL includes https://target.example:8443/path."
+        );
+        assert!(skill.body.contains("frontmatter-looking separators"));
+    }
+
+    #[test]
+    fn ignores_runtime_skill_frontmatter_fields_outside_trigger_contract() {
+        let raw = r#"---
+name: web-vulnerability-discovery
+description: Use for website vulnerability discovery.
+metadata:
+  short-description: Extra fields belong in agents/openai.yaml.
+---
+
+# Web Vulnerability Discovery
+"#;
+
+        let skill = parse_runtime_skill(raw).expect("skill should parse");
+
+        assert_eq!(skill.name, "web-vulnerability-discovery");
+        assert_eq!(
+            skill.description,
+            "Use for website vulnerability discovery."
+        );
+    }
+
+    #[test]
+    fn rejects_runtime_skill_with_invalid_name() {
+        let raw = r#"---
+name: Web Vulnerability Discovery
+description: Use for website vulnerability discovery.
+---
+
+# Web Vulnerability Discovery
+"#;
+
+        assert!(parse_runtime_skill(raw).is_none());
+    }
+
+    #[test]
+    fn web_vulnerability_skill_matches_chinese_site_request() {
+        let skill = RuntimeSkill {
+            name: "web-vulnerability-discovery".to_owned(),
+            description: "Guide authorized website vulnerability discovery.".to_owned(),
+            body: "body".to_owned(),
+        };
+
+        assert!(runtime_skill_matches(
+            "帮我看看这个网站 https://target.example 有没有漏洞",
+            &skill
+        ));
+        assert!(!runtime_skill_matches("你好，介绍一下你自己", &skill));
+    }
+
+    #[test]
+    fn active_skill_context_is_added_to_agent_prompt() {
+        let skill_context = format_active_skill_context(&[RuntimeSkill {
+            name: "web-vulnerability-discovery".to_owned(),
+            description: "Guide authorized website vulnerability discovery.".to_owned(),
+            body: "Use MCP browser observations first.".to_owned(),
+        }]);
+        let prompt =
+            format_agent_loop_system_prompt(&[], &RemoteMcpToolbox::empty(), &skill_context);
+
+        assert!(prompt.contains("# Runtime Skill Instructions"));
+        assert!(prompt.contains("$web-vulnerability-discovery"));
+        assert!(prompt.contains("Use MCP browser observations first."));
+    }
+
+    #[test]
     fn agent_prompt_includes_tool_schemas_and_followup_rule() {
         let tools = vec![ToolSpec::new(
             "database_risk_scan",
             "Probe database risk.",
             json!({"type":"object","required":["url"]}),
         )];
-        let prompt = format_agent_loop_system_prompt(&tools, &RemoteMcpToolbox::empty());
+        let prompt = format_agent_loop_system_prompt(&tools, &RemoteMcpToolbox::empty(), "");
 
         assert!(prompt.contains("database_risk_scan"));
         assert!(prompt.contains("1.get 2.date=2026-05-13"));
@@ -2057,6 +2410,7 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
         assert!(prompt.contains("verification_url"));
         assert!(prompt.contains("confirm_time_based"));
         assert!(prompt.contains("weak_session_id_scan"));
+        assert!(prompt.contains("xss_risk_scan"));
         assert!(prompt.contains("dvwaSession"));
         assert!(prompt.contains("sample_coverage"));
         assert!(prompt.contains("attack_types"));
@@ -2070,7 +2424,7 @@ _HANDLE tool result? Actually must return JSON only. Since we call tool, final c
             "Probe database risk.",
             json!({"type":"object","required":["url"]}),
         )];
-        let prompt = format_native_agent_loop_system_prompt(&tools, &RemoteMcpToolbox::empty());
+        let prompt = format_native_agent_loop_system_prompt(&tools, &RemoteMcpToolbox::empty(), "");
 
         assert!(prompt.contains("native tool calls"));
         assert!(prompt.contains("database_risk_scan"));
