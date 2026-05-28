@@ -344,76 +344,233 @@ async fn read_agent_responses_sse(
     on_delta: CompletionDeltaCallback,
 ) -> Result<AgentTurnResponse> {
     let mut decoder = SseDecoder::default();
-    let mut content = String::new();
-    let mut output_items = Vec::new();
-    let mut tool_calls = Vec::new();
+    let mut state = CodexAgentStreamState::default();
 
     while let Some(chunk) = response.chunk().await? {
         for data in decoder.push(&String::from_utf8_lossy(&chunk)) {
-            collect_agent_event(
-                &data,
-                &mut content,
-                &mut output_items,
-                &mut tool_calls,
-                &on_delta,
-            );
+            state.collect_sse_data(&data, &on_delta);
         }
     }
 
     for data in decoder.finish() {
-        collect_agent_event(
-            &data,
-            &mut content,
-            &mut output_items,
-            &mut tool_calls,
-            &on_delta,
-        );
+        state.collect_sse_data(&data, &on_delta);
     }
 
-    if content.is_empty() && tool_calls.is_empty() {
-        Err(LlmError::EmptyResponse)
-    } else {
-        Ok(AgentTurnResponse {
-            content,
-            tool_calls,
-            output_items,
-            model,
-            usage: None,
+    state.into_response(model)
+}
+
+#[derive(Debug, Default)]
+struct CodexAgentStreamState {
+    content: String,
+    output_items: Vec<AgentToolTranscriptItem>,
+    tool_calls: Vec<AgentToolCall>,
+    partial_tool_calls: Vec<PartialResponseToolCall>,
+}
+
+impl CodexAgentStreamState {
+    fn collect_sse_data(&mut self, data: &str, on_delta: &CompletionDeltaCallback) {
+        if data.trim().is_empty() || data.trim() == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
+            return;
+        };
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    self.content.push_str(delta);
+                    on_delta(delta);
+                }
+            }
+            Some("response.output_item.added") => {
+                if let Some(item) = value.get("item") {
+                    self.collect_function_call_item(item, false);
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    let item_id = value.get("item_id").and_then(Value::as_str);
+                    self.append_function_call_arguments(item_id, delta);
+                }
+            }
+            Some("response.function_call_arguments.done") => {
+                let item_id = value.get("item_id").and_then(Value::as_str);
+                if let Some(arguments) = value.get("arguments").and_then(Value::as_str) {
+                    self.set_function_call_arguments(item_id, arguments);
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = value.get("item") {
+                    self.collect_function_call_item(item, true);
+                }
+            }
+            Some("response.completed") => {
+                if let Some(response) = value.get("response") {
+                    collect_response_items(response, &mut self.output_items, &mut self.tool_calls);
+                    if self.content.is_empty() {
+                        collect_text_from_response(response, &mut self.content);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_function_call_item(&mut self, item: &Value, finalize: bool) {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return;
+        }
+
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let index = self.partial_tool_call_index(id, call_id);
+        update_partial_tool_call_from_item(&mut self.partial_tool_calls[index], item);
+
+        if finalize {
+            self.finalize_partial_tool_call(index);
+        }
+    }
+
+    fn append_function_call_arguments(&mut self, item_id: Option<&str>, delta: &str) {
+        let index = self.partial_tool_call_index(item_id.unwrap_or_default(), "");
+        self.partial_tool_calls[index].arguments.push_str(delta);
+    }
+
+    fn set_function_call_arguments(&mut self, item_id: Option<&str>, arguments: &str) {
+        let index = self.partial_tool_call_index(item_id.unwrap_or_default(), "");
+        self.partial_tool_calls[index].arguments = arguments.to_owned();
+    }
+
+    fn partial_tool_call_index(&mut self, id: &str, call_id: &str) -> usize {
+        if id.is_empty()
+            && call_id.is_empty()
+            && let Some(index) = self.partial_tool_calls.len().checked_sub(1)
+        {
+            return index;
+        }
+
+        if let Some(index) = self.partial_tool_calls.iter().position(|partial| {
+            (!id.is_empty() && partial.id == id)
+                || (!call_id.is_empty() && partial.call_id == call_id)
+        }) {
+            return index;
+        }
+
+        self.partial_tool_calls.push(PartialResponseToolCall {
+            id: id.to_owned(),
+            call_id: call_id.to_owned(),
+            ..PartialResponseToolCall::default()
+        });
+        self.partial_tool_calls.len() - 1
+    }
+
+    fn finalize_partial_tool_call(&mut self, index: usize) {
+        let Some(partial) = self.partial_tool_calls.get_mut(index) else {
+            return;
+        };
+        if partial.finalized {
+            return;
+        }
+        let Some(tool_call) = partial.to_agent_tool_call() else {
+            return;
+        };
+        partial.finalized = true;
+        push_tool_call_if_absent(&mut self.output_items, &mut self.tool_calls, tool_call);
+    }
+
+    fn finalize_all_partial_tool_calls(&mut self) {
+        for index in 0..self.partial_tool_calls.len() {
+            self.finalize_partial_tool_call(index);
+        }
+    }
+
+    fn into_response(mut self, model: String) -> Result<AgentTurnResponse> {
+        self.finalize_all_partial_tool_calls();
+
+        if self.content.is_empty() && self.tool_calls.is_empty() {
+            Err(LlmError::EmptyResponse)
+        } else {
+            Ok(AgentTurnResponse {
+                content: self.content,
+                tool_calls: self.tool_calls,
+                output_items: self.output_items,
+                model,
+                usage: None,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PartialResponseToolCall {
+    id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    finalized: bool,
+}
+
+impl PartialResponseToolCall {
+    fn to_agent_tool_call(&self) -> Option<AgentToolCall> {
+        if self.name.is_empty() {
+            return None;
+        }
+        let call_id = if self.call_id.is_empty() {
+            if self.id.is_empty() {
+                self.name.clone()
+            } else {
+                self.id.clone()
+            }
+        } else {
+            self.call_id.clone()
+        };
+        let id = if self.id.is_empty() {
+            call_id.clone()
+        } else {
+            self.id.clone()
+        };
+        Some(AgentToolCall {
+            id,
+            call_id,
+            name: self.name.clone(),
+            input: parse_function_arguments(Some(&Value::String(self.arguments.clone()))),
         })
     }
 }
 
-fn collect_agent_event(
-    data: &str,
-    content: &mut String,
+fn update_partial_tool_call_from_item(partial: &mut PartialResponseToolCall, item: &Value) {
+    if let Some(id) = item.get("id").and_then(Value::as_str) {
+        partial.id = id.to_owned();
+    }
+    if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+        partial.call_id = call_id.to_owned();
+    }
+    if let Some(name) = item.get("name").and_then(Value::as_str) {
+        partial.name = name.to_owned();
+    }
+    if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+        partial.arguments = arguments.to_owned();
+    }
+}
+
+fn push_tool_call_if_absent(
     output_items: &mut Vec<AgentToolTranscriptItem>,
     tool_calls: &mut Vec<AgentToolCall>,
-    on_delta: &CompletionDeltaCallback,
+    tool_call: AgentToolCall,
 ) {
-    if data.trim().is_empty() || data.trim() == "[DONE]" {
+    if tool_calls.iter().any(|existing| {
+        existing.call_id == tool_call.call_id
+            || (!tool_call.id.is_empty() && existing.id == tool_call.id)
+    }) {
         return;
     }
-    let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
-        return;
-    };
 
-    match value.get("type").and_then(Value::as_str) {
-        Some("response.output_text.delta") => {
-            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                content.push_str(delta);
-                on_delta(delta);
-            }
-        }
-        Some("response.completed") => {
-            if let Some(response) = value.get("response") {
-                collect_response_items(response, output_items, tool_calls);
-                if content.is_empty() {
-                    collect_text_from_response(response, content);
-                }
-            }
-        }
-        _ => {}
-    }
+    output_items.push(AgentToolTranscriptItem::tool_call(&tool_call));
+    tool_calls.push(tool_call);
 }
 
 fn collect_response_items(
@@ -450,8 +607,7 @@ fn collect_response_items(
             name: name.to_owned(),
             input,
         };
-        output_items.push(AgentToolTranscriptItem::tool_call(&tool_call));
-        tool_calls.push(tool_call);
+        push_tool_call_if_absent(output_items, tool_calls, tool_call);
     }
 }
 
@@ -521,5 +677,93 @@ mod tests {
                 input: json!({ "text": "hi" }),
             }]
         );
+    }
+
+    #[test]
+    fn agent_stream_collects_output_item_tool_call() {
+        let mut state = CodexAgentStreamState::default();
+        let on_delta: CompletionDeltaCallback = std::sync::Arc::new(|_| {});
+
+        state.collect_sse_data(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"echo","arguments":"","status":"in_progress"}}"#,
+            &on_delta,
+        );
+        state.collect_sse_data(
+            &json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "{\"text\""
+            })
+            .to_string(),
+            &on_delta,
+        );
+        state.collect_sse_data(
+            &json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": ":\"hi\"}"
+            })
+            .to_string(),
+            &on_delta,
+        );
+        state.collect_sse_data(
+            r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"text\":\"hi\"}"}"#,
+            &on_delta,
+        );
+        state.collect_sse_data(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"echo","arguments":"{\"text\":\"hi\"}","status":"completed"}}"#,
+            &on_delta,
+        );
+        state.collect_sse_data(
+            r#"{"type":"response.completed","response":{"output":[]}}"#,
+            &on_delta,
+        );
+
+        let response = state
+            .into_response("model".to_owned())
+            .expect("streamed tool call should produce response");
+
+        assert_eq!(response.content, "");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "fc_1");
+        assert_eq!(response.tool_calls[0].call_id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "echo");
+        assert_eq!(response.tool_calls[0].input, json!({"text":"hi"}));
+        assert_eq!(
+            response.output_items,
+            vec![AgentToolTranscriptItem::ToolCall {
+                call_id: "call_1".to_owned(),
+                name: "echo".to_owned(),
+                input: json!({"text":"hi"}),
+            }]
+        );
+    }
+
+    #[test]
+    fn agent_stream_finalizes_function_call_when_done_item_is_missing() {
+        let mut state = CodexAgentStreamState::default();
+        let on_delta: CompletionDeltaCallback = std::sync::Arc::new(|_| {});
+
+        state.collect_sse_data(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"echo","arguments":"","status":"in_progress"}}"#,
+            &on_delta,
+        );
+        state.collect_sse_data(
+            &json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "{\"text\":\"hi\"}"
+            })
+            .to_string(),
+            &on_delta,
+        );
+
+        let response = state
+            .into_response("model".to_owned())
+            .expect("partial streamed tool call should be finalized");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "echo");
+        assert_eq!(response.tool_calls[0].input, json!({"text":"hi"}));
     }
 }

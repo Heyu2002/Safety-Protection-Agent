@@ -124,7 +124,7 @@ struct McpAddArgs {
 }
 
 pub async fn run_chat_cli(default_repl: bool) -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+    dotenvy::dotenv_override().ok();
 
     let args = ChatCliArgs::parse();
     if let Some(command) = args.command {
@@ -818,7 +818,7 @@ async fn run_agent_loop(
     let tools = combined_tool_specs(&registry, remote_mcp.status());
     let active_skill_context = load_active_skill_context(prompt).unwrap_or_default();
 
-    let response = if client.supports_native_tools() {
+    let response = if client.supports_native_tools() && native_tools_enabled_from_env() {
         run_native_agent_loop(
             client,
             history,
@@ -848,6 +848,19 @@ async fn run_agent_loop(
 
     remote_mcp.shutdown().await;
     response
+}
+
+fn native_tools_enabled_from_env() -> bool {
+    env_flag_enabled("LLM_NATIVE_TOOLS").unwrap_or(true)
+}
+
+fn env_flag_enabled(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn combined_tool_specs(registry: &ToolRegistry, remote_mcp: &RemoteMcpToolbox) -> Vec<ToolSpec> {
@@ -1692,14 +1705,11 @@ fn build_agent_messages(
     remote_mcp: &RemoteMcpToolbox,
     active_skill_context: &str,
 ) -> Vec<ChatMessage> {
-    let mut messages = vec![ChatMessage::system(format_agent_loop_system_prompt(
-        tools,
-        remote_mcp,
-        active_skill_context,
-    ))];
-    messages.extend(history.iter().map(copy_message));
-    messages.push(ChatMessage::user(prompt));
-    messages
+    build_agent_turn_messages(
+        format_agent_loop_system_prompt(tools, remote_mcp, active_skill_context),
+        history,
+        prompt,
+    )
 }
 
 fn build_native_agent_messages(
@@ -1709,12 +1719,34 @@ fn build_native_agent_messages(
     remote_mcp: &RemoteMcpToolbox,
     active_skill_context: &str,
 ) -> Vec<ChatMessage> {
-    let mut messages = vec![ChatMessage::system(format_native_agent_loop_system_prompt(
-        tools,
-        remote_mcp,
-        active_skill_context,
-    ))];
-    messages.extend(history.iter().map(copy_message));
+    build_agent_turn_messages(
+        format_native_agent_loop_system_prompt(tools, remote_mcp, active_skill_context),
+        history,
+        prompt,
+    )
+}
+
+fn build_agent_turn_messages(
+    mut system_prompt: String,
+    history: &[ChatMessage],
+    prompt: &str,
+) -> Vec<ChatMessage> {
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    let default_system = default_system_prompt();
+
+    for message in history {
+        match &message.role {
+            ChatRole::System => {
+                if message.content != default_system {
+                    system_prompt.push_str("\n\n# Conversation Context\n\n");
+                    system_prompt.push_str(&message.content);
+                }
+            }
+            _ => messages.push(copy_message(message)),
+        }
+    }
+
+    messages.insert(0, ChatMessage::system(system_prompt));
     messages.push(ChatMessage::user(prompt));
     messages
 }
@@ -2033,6 +2065,8 @@ mod tests {
     use async_trait::async_trait;
     use clap::CommandFactory;
     use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Default)]
     struct FakeClient {
@@ -2430,5 +2464,72 @@ description: Use for website vulnerability discovery.
         assert!(prompt.contains("database_risk_scan"));
         assert!(!prompt.contains("SPA_DONE"));
         assert!(!prompt.contains("\"action\":\"call_tool\""));
+    }
+
+    #[test]
+    fn agent_turn_messages_emit_single_system_message() {
+        let messages = build_agent_turn_messages(
+            "agent loop".to_owned(),
+            &[
+                ChatMessage::system(default_system_prompt()),
+                ChatMessage::user("previous user"),
+                ChatMessage::assistant("previous answer"),
+            ],
+            "current user",
+        );
+
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message.role, ChatRole::System))
+                .count(),
+            1
+        );
+        assert_eq!(messages[0].content, "agent loop");
+        assert_eq!(messages[1].content, "previous user");
+        assert_eq!(messages[2].content, "previous answer");
+        assert_eq!(messages[3].content, "current user");
+    }
+
+    #[test]
+    fn agent_turn_messages_merge_compacted_system_context() {
+        let messages = build_agent_turn_messages(
+            "agent loop".to_owned(),
+            &[
+                ChatMessage::system(default_system_prompt()),
+                ChatMessage::system("Compacted prior context."),
+            ],
+            "current user",
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0].role, ChatRole::System));
+        assert!(messages[0].content.contains("agent loop"));
+        assert!(messages[0].content.contains("# Conversation Context"));
+        assert!(messages[0].content.contains("Compacted prior context."));
+    }
+
+    #[test]
+    fn native_tools_env_flag_defaults_to_enabled() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        unsafe {
+            std::env::remove_var("LLM_NATIVE_TOOLS");
+        }
+
+        assert!(native_tools_enabled_from_env());
+    }
+
+    #[test]
+    fn native_tools_env_flag_can_disable_native_tool_calls() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        unsafe {
+            std::env::set_var("LLM_NATIVE_TOOLS", "false");
+        }
+
+        assert!(!native_tools_enabled_from_env());
+
+        unsafe {
+            std::env::remove_var("LLM_NATIVE_TOOLS");
+        }
     }
 }

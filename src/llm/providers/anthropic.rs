@@ -27,7 +27,7 @@ impl LlmClient for AnthropicClient {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let base_url = self.config.base_url.as_deref().unwrap_or_default();
         let api_key = self.config.api_key.as_deref().unwrap_or_default();
-        let url = format!("{}/messages", base_url.trim_end_matches('/'));
+        let url = anthropic_messages_url(base_url);
 
         let mut system_messages = Vec::new();
         let mut messages = Vec::with_capacity(request.messages.len());
@@ -94,6 +94,15 @@ impl LlmClient for AnthropicClient {
     }
 }
 
+fn anthropic_messages_url(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/v1") {
+        format!("{base_url}/messages")
+    } else {
+        format!("{base_url}/v1/messages")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     model: String,
@@ -114,4 +123,25 @@ enum AnthropicContent {
 struct AnthropicUsage {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_messages_url_accepts_root_relay_base_url() {
+        assert_eq!(
+            anthropic_messages_url("https://api.duojie.games"),
+            "https://api.duojie.games/v1/messages"
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_url_accepts_v1_base_url() {
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
 }

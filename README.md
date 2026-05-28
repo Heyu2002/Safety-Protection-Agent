@@ -106,6 +106,39 @@ OPENAI_MODEL=gpt-4.1-mini
 OPENAI_BASE_URL=https://api.openai.com/v1
 ```
 
+For custom relays, use the provider type from the relay's model config. SPA also
+accepts generic relay variables for `openai`, `openai-compatible`,
+`openai-completions`, `openai-responses`, `anthropic`, and `gemini`. When
+`LLM_*` variables are set, they take priority over provider-specific variables
+such as `OPENAI_*`.
+
+```env
+LLM_PROVIDER=openai-responses
+LLM_API_KEY=your-relay-key
+LLM_MODEL=your-responses-model
+LLM_BASE_URL=https://relay.example.com/v1
+```
+
+If a Chat Completions relay rejects `tools`, `tool_choice`, or
+`parallel_tool_calls`, disable native tool calls and use SPA's fallback agent
+protocol:
+
+```env
+LLM_NATIVE_TOOLS=false
+```
+
+For a relay model declared as `provider: "anthropic"`:
+
+```env
+LLM_PROVIDER=anthropic
+LLM_API_KEY=your-relay-key
+LLM_MODEL=your-anthropic-compatible-model
+LLM_BASE_URL=https://relay.example.com
+```
+
+Anthropic-compatible base URLs may be either the API root or a `/v1` URL; SPA
+normalizes both to the Messages endpoint.
+
 Reuse a local Codex ChatGPT login:
 
 ```env

@@ -42,6 +42,7 @@ impl LlmClient for OpenAiCompatibleClient {
             .http
             .post(url)
             .bearer_auth(api_key)
+            .header("x-api-key", api_key)
             .json(&body)
             .send()
             .await?;
@@ -86,6 +87,7 @@ impl LlmClient for OpenAiCompatibleClient {
             .http
             .post(url)
             .bearer_auth(api_key)
+            .header("x-api-key", api_key)
             .header("Accept", "text/event-stream")
             .json(&body)
             .send()
@@ -122,6 +124,7 @@ impl LlmClient for OpenAiCompatibleClient {
             .http
             .post(url)
             .bearer_auth(api_key)
+            .header("x-api-key", api_key)
             .header("Accept", "text/event-stream")
             .json(&body)
             .send()

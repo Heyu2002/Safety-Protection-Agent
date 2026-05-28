@@ -167,6 +167,34 @@ OPENAI_BASE_URL=https://你的中转站域名/v1
 POST /v1/responses
 ```
 
+如果中转站给的是自定义模型配置，按它声明的 `provider` 来选 `LLM_PROVIDER`，不要把所有模型都当成 `openai-compatible`。也可以使用通用变量 `LLM_API_KEY`、`LLM_MODEL`、`LLM_BASE_URL`，适用于 `openai`、`openai-compatible`、`openai-completions`、`openai-responses`、`anthropic` 和 `gemini`。设置了 `LLM_*` 时，它们会优先于系统里可能残留的 `OPENAI_*` 等专用变量。
+
+例如中转站声明为 OpenAI Responses 的模型：
+
+```env
+LLM_PROVIDER=openai-responses
+LLM_API_KEY=你的中转站key
+LLM_MODEL=你的Responses模型名
+LLM_BASE_URL=https://你的中转站域名/v1
+```
+
+如果 Chat Completions 中转站或模型不接受 `tools`、`tool_choice`、`parallel_tool_calls` 这类原生工具调用参数，可以关闭原生工具调用，改走 SPA 的 fallback agent 协议：
+
+```env
+LLM_NATIVE_TOOLS=false
+```
+
+例如中转站声明为 `provider: "anthropic"` 的模型：
+
+```env
+LLM_PROVIDER=anthropic
+LLM_API_KEY=你的中转站key
+LLM_MODEL=你的Anthropic兼容模型名
+LLM_BASE_URL=https://你的中转站域名
+```
+
+Anthropic 兼容接口的 base URL 可以写 API 根地址或 `/v1` 地址，程序会自动拼到 Messages endpoint。
+
 ## Kimi 配置
 
 Kimi Code / Kimi CLI 订阅使用 `api.kimi.com` 账号体系：
