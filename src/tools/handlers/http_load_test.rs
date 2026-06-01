@@ -13,6 +13,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::tools::{
     Result, ToolCall, ToolError, ToolHandler, ToolOutput, ToolProgress, ToolProgressCallback,
     ToolSpec,
+    risk::{NORMAL, WARNING},
 };
 
 const DEFAULT_DURATION_SECS: u64 = 60;
@@ -442,12 +443,14 @@ struct LoadTestMetrics {
     status_counts: BTreeMap<String, u64>,
     error_samples: Vec<String>,
     latency_ms: LatencyMetrics,
+    risk_level: String,
     sample_coverage: Vec<String>,
     attack_types: Vec<String>,
     remediation: Vec<String>,
 }
 
 impl LoadTestMetrics {
+    #[allow(clippy::too_many_arguments)]
     fn from_outcomes(
         url: String,
         method: String,
@@ -473,10 +476,11 @@ impl LoadTestMetrics {
             if let Some(latency) = outcome.latency_ms {
                 latencies.push(latency);
             }
-            if let Some(error) = &outcome.error {
-                if error_samples.len() < 5 && !error_samples.contains(error) {
-                    error_samples.push(error.to_owned());
-                }
+            if let Some(error) = &outcome.error
+                && error_samples.len() < 5
+                && !error_samples.contains(error)
+            {
+                error_samples.push(error.to_owned());
             }
         }
 
@@ -485,6 +489,7 @@ impl LoadTestMetrics {
         let failed_requests = completed_requests.saturating_sub(successful_requests);
         let achieved_requests_per_minute = completed_requests as f64 / elapsed_secs * 60.0;
         let latency_ms = LatencyMetrics::from_latencies(latencies);
+        let risk_level = load_test_risk_level(failed_requests, &latency_ms).to_owned();
         let sample_coverage = load_test_sample_coverage(
             &method,
             duration_secs,
@@ -515,6 +520,7 @@ impl LoadTestMetrics {
             status_counts,
             error_samples,
             latency_ms,
+            risk_level,
             sample_coverage,
             attack_types,
             remediation,
@@ -523,16 +529,26 @@ impl LoadTestMetrics {
 
     fn summary(&self) -> String {
         format!(
-            "HTTP load test completed: {}/{} successful, {:.1} rpm achieved, p95={} ms, p99={} ms.",
+            "HTTP load test completed: {}/{} successful, {:.1} rpm achieved, p95={} ms, p99={} ms, risk level {}.",
             self.successful_requests,
             self.completed_requests,
             self.achieved_requests_per_minute,
             self.latency_ms.p95.unwrap_or(0),
-            self.latency_ms.p99.unwrap_or(0)
+            self.latency_ms.p99.unwrap_or(0),
+            self.risk_level
         )
     }
 }
 
+fn load_test_risk_level(failed_requests: u64, latency_ms: &LatencyMetrics) -> &'static str {
+    if failed_requests > 0 || latency_ms.p95.unwrap_or(0) > 1_000 {
+        WARNING
+    } else {
+        NORMAL
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn load_test_sample_coverage(
     method: &str,
     duration_secs: u64,

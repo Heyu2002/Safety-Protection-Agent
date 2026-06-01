@@ -36,17 +36,12 @@ pub struct RemoteMcpServerConfig {
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RemoteMcpTransport {
+    #[default]
     StreamableHttp,
     Stdio,
-}
-
-impl Default for RemoteMcpTransport {
-    fn default() -> Self {
-        Self::StreamableHttp
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1071,7 +1066,7 @@ mod tests {
     fn resolves_npx_to_executable_path() {
         let resolved = resolve_stdio_command("npx");
 
-        if resolved != PathBuf::from("npx") {
+        if resolved != std::path::Path::new("npx") {
             assert!(resolved.extension().is_some());
         }
     }

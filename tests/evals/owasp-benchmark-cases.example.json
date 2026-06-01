@@ -1,0 +1,12 @@
+[
+  {
+    "id": "BenchmarkTest00001",
+    "category": "replace-with-category-from-expectedresults",
+    "vulnerable": "replace-with-expected-true-or-false",
+    "cwe": "replace-with-cwe",
+    "method": "GET",
+    "path": "/BenchmarkTest00001",
+    "params": {},
+    "notes": "Example manifest entry. Prefer generating cases from the OWASP Benchmark expected results CSV for real evaluation."
+  }
+]

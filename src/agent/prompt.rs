@@ -34,6 +34,17 @@ mod tests {
     }
 
     #[test]
+    fn default_prompt_defines_red_team_judgment_rules() {
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("# Red-Team Judgment Rules"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("do not treat"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("not vulnerable"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("bounded parameter discovery"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("Favor recall"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("bounded low-impact probes"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("stopping at doubt"));
+    }
+
+    #[test]
     fn default_prompt_defines_agent_identity() {
         assert!(DEFAULT_SYSTEM_PROMPT.contains("# Identity"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("Your product name is Safety Protection Agent"));
@@ -43,6 +54,7 @@ mod tests {
 
     #[test]
     fn default_prompt_requires_standard_tool_report_sections() {
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("报告名称"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("sample coverage"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("attack types"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("how to fix"));

@@ -452,10 +452,10 @@ struct ResponsesApiResponse {
 
 impl ResponsesApiResponse {
     fn output_text(&self) -> Option<String> {
-        if let Some(output_text) = &self.output_text {
-            if !output_text.is_empty() {
-                return Some(output_text.to_owned());
-            }
+        if let Some(output_text) = &self.output_text
+            && !output_text.is_empty()
+        {
+            return Some(output_text.to_owned());
         }
 
         let mut parts = Vec::new();

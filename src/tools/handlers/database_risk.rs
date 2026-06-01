@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::tools::{
     Result, ToolCall, ToolError, ToolHandler, ToolOutput, ToolProgress, ToolProgressCallback,
     ToolSpec,
+    risk::{self, DANGER, NORMAL, WARNING},
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -176,18 +177,13 @@ struct DatabaseRiskInput {
     max_time_delay_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum BodyFormat {
+    #[default]
     Auto,
     Json,
     Form,
-}
-
-impl Default for BodyFormat {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Clone)]
@@ -506,7 +502,7 @@ fn analyze_field(
         if let Some(pattern) = database_error_pattern(&error_probe.observation.body_preview) {
             signals.push(RiskSignal {
                 kind: "database_error_leak".to_owned(),
-                severity: "high".to_owned(),
+                severity: DANGER.to_owned(),
                 evidence: format!(
                     "{} probe with payload `{}` response contained database error pattern: {pattern}",
                     error_probe.name, error_probe.payload
@@ -519,7 +515,7 @@ fn analyze_field(
     if !baseline_usable {
         signals.push(RiskSignal {
             kind: "baseline_unavailable".to_owned(),
-            severity: "info".to_owned(),
+            severity: WARNING.to_owned(),
             evidence: format!(
                 "baseline request was not a usable business response: status {:?}, error {:?}",
                 baseline.status, baseline.error
@@ -532,7 +528,7 @@ fn analyze_field(
             if status_changed(baseline, &error_probe.observation) {
                 signals.push(RiskSignal {
                     kind: "status_change_on_quote".to_owned(),
-                    severity: "medium".to_owned(),
+                    severity: WARNING.to_owned(),
                     evidence: format!(
                         "baseline status {:?}, {} probe with payload `{}` status {:?}",
                         baseline.status,
@@ -548,7 +544,7 @@ fn analyze_field(
             if let Some(evidence) = boolean_difference_evidence(baseline, pair) {
                 signals.push(RiskSignal {
                     kind: "boolean_response_difference".to_owned(),
-                    severity: "medium".to_owned(),
+                    severity: DANGER.to_owned(),
                     evidence,
                 });
             }
@@ -564,7 +560,7 @@ fn analyze_field(
             if delta >= max_time_delay_ms {
                 signals.push(RiskSignal {
                     kind: "time_delay_signal".to_owned(),
-                    severity: "medium".to_owned(),
+                    severity: WARNING.to_owned(),
                     evidence: format!(
                         "{} probe with payload `{}` latency {} ms vs baseline {} ms",
                         time_probe.name,
@@ -581,7 +577,7 @@ fn analyze_field(
         if confirmation.confirmed {
             signals.push(RiskSignal {
                 kind: "time_delay_confirmed".to_owned(),
-                severity: "high".to_owned(),
+                severity: DANGER.to_owned(),
                 evidence: confirmation.evidence(),
             });
         }
@@ -621,8 +617,10 @@ impl DatabaseRiskReport {
             method: plan.method.to_string(),
             body_format: body_format_label(plan.body_format).to_owned(),
             tested_fields: Vec::new(),
-            risk_level: "unknown".to_owned(),
-            summary: "No injectable query or body fields were provided or detected.".to_owned(),
+            risk_level: WARNING.to_owned(),
+            summary: format!(
+                "Database attack surface scan completed: no injectable query or body fields were provided or detected, overall risk {WARNING}."
+            ),
             sample_coverage: vec![
                 format!("Baseline request: {} {}", plan.method, plan.url),
                 "No query parameters, JSON body fields, or injectable_fields were available to mutate.".to_owned(),
@@ -636,7 +634,7 @@ impl DatabaseRiskReport {
             findings: Vec::new(),
             issues: vec![DatabaseRiskIssue {
                 title: "No testable database input point was provided".to_owned(),
-                severity: "info".to_owned(),
+                severity: WARNING.to_owned(),
                 category: "scan_coverage".to_owned(),
                 affected_fields: Vec::new(),
                 evidence: vec![
@@ -665,12 +663,12 @@ impl DatabaseRiskReport {
         let risk_level = aggregate_risk(&findings);
         let risky_fields = findings
             .iter()
-            .filter(|finding| finding.risk != "low")
+            .filter(|finding| !risk::is_normal(&finding.risk))
             .count();
         let issues = issues_from_findings(&findings);
         let issue_count = issues
             .iter()
-            .filter(|issue| issue.severity != "info")
+            .filter(|issue| risk::is_issue(&issue.severity))
             .count();
         let sample_coverage = database_sample_coverage(&plan, &findings);
         let attack_types = database_attack_types(&issues);
@@ -701,6 +699,7 @@ impl DatabaseRiskReport {
 #[derive(Debug, Serialize)]
 struct FieldFinding {
     field: String,
+    #[serde(rename = "risk_level")]
     risk: String,
     signals: Vec<RiskSignal>,
 }
@@ -708,6 +707,7 @@ struct FieldFinding {
 #[derive(Debug, Serialize)]
 struct RiskSignal {
     kind: String,
+    #[serde(rename = "risk_level")]
     severity: String,
     evidence: String,
 }
@@ -715,6 +715,7 @@ struct RiskSignal {
 #[derive(Debug, Serialize)]
 struct DatabaseRiskIssue {
     title: String,
+    #[serde(rename = "risk_level")]
     severity: String,
     category: String,
     affected_fields: Vec<String>,
@@ -831,7 +832,7 @@ struct BooleanPayloadPair {
 fn payloads_for_field(plan: &ScanPlan, field: &str) -> FieldPayloads {
     let base_value = field_value(plan, field).unwrap_or_else(|| "1".to_owned());
     let numeric = looks_numeric(&base_value);
-    let sleep_secs = ((plan.max_time_delay_ms + 999) / 1000).clamp(1, 3);
+    let sleep_secs = plan.max_time_delay_ms.div_ceil(1000).clamp(1, 3);
 
     let mut error_payloads = Vec::new();
     push_probe_payload(
@@ -1039,9 +1040,9 @@ fn resolve_body_format(headers: &HeaderMap, body_format: BodyFormat, body: &Valu
         BodyFormat::Auto => {
             if content_type_contains(headers, "application/json") {
                 BodyFormat::Json
-            } else if content_type_contains(headers, "application/x-www-form-urlencoded") {
-                BodyFormat::Form
-            } else if form_fields(body).is_some() {
+            } else if content_type_contains(headers, "application/x-www-form-urlencoded")
+                || form_fields(body).is_some()
+            {
                 BodyFormat::Form
             } else {
                 BodyFormat::Json
@@ -1088,7 +1089,7 @@ fn body_format_label(body_format: BodyFormat) -> &'static str {
 
 fn database_error_pattern(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
-    for pattern in [
+    [
         "sql syntax",
         "mysql",
         "postgresql",
@@ -1099,12 +1100,9 @@ fn database_error_pattern(text: &str) -> Option<&'static str> {
         "unterminated quoted string",
         "syntax error at or near",
         "you have an error in your sql syntax",
-    ] {
-        if lower.contains(pattern) {
-            return Some(pattern);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|pattern| lower.contains(pattern))
 }
 
 fn status_changed(left: &ProbeObservation, right: &ProbeObservation) -> bool {
@@ -1294,23 +1292,11 @@ fn known_sqli_result_marker_difference(true_body: &str, false_body: &str) -> boo
 }
 
 fn risk_from_signals(signals: &[RiskSignal]) -> String {
-    if signals.iter().any(|signal| signal.severity == "high") {
-        "high".to_owned()
-    } else if signals.iter().any(|signal| signal.severity == "medium") {
-        "medium".to_owned()
-    } else {
-        "low".to_owned()
-    }
+    risk::max_label(signals.iter().map(|signal| signal.severity.as_str())).to_owned()
 }
 
 fn aggregate_risk(findings: &[FieldFinding]) -> &'static str {
-    if findings.iter().any(|finding| finding.risk == "high") {
-        "high"
-    } else if findings.iter().any(|finding| finding.risk == "medium") {
-        "medium"
-    } else {
-        "low"
-    }
+    risk::max_label(findings.iter().map(|finding| finding.risk.as_str()))
 }
 
 fn database_risk_summary(
@@ -1327,7 +1313,7 @@ fn database_risk_summary(
 
     let issue_titles = issues
         .iter()
-        .filter(|issue| issue.severity != "info")
+        .filter(|issue| risk::is_issue(&issue.severity))
         .map(|issue| {
             if issue.affected_fields.is_empty() {
                 issue.title.clone()
@@ -1351,7 +1337,7 @@ fn issues_from_findings(findings: &[FieldFinding]) -> Vec<DatabaseRiskIssue> {
         findings,
         "database_error_leak",
         "SQL/database error information disclosure",
-        "high",
+        DANGER,
         "information_disclosure",
         "The endpoint returned database error text when a quote payload was submitted. This leaks implementation details and often indicates unsafe query construction.",
         "Return generic application errors, log database errors server-side only, and verify all database access uses bind parameters.",
@@ -1364,7 +1350,7 @@ fn issues_from_findings(findings: &[FieldFinding]) -> Vec<DatabaseRiskIssue> {
         findings,
         "boolean_response_difference",
         "Boolean-condition response difference",
-        "medium",
+        DANGER,
         "sql_injection_signal",
         "True and false condition payloads produced materially different responses. This can be a SQL injection signal if the field reaches a query predicate.",
         "Review the flagged query path and add regression tests for boolean SQL injection payloads.",
@@ -1375,7 +1361,7 @@ fn issues_from_findings(findings: &[FieldFinding]) -> Vec<DatabaseRiskIssue> {
         findings,
         "time_delay_confirmed",
         "Time-based SQL injection confirmed",
-        "high",
+        DANGER,
         "sql_injection",
         "Repeated baseline/delayed probe pairs confirmed that a user-controlled field can trigger database time delay behavior.",
         "Treat this as exploitable SQL injection: parameterize the affected query, add strict type validation, and verify the fix with the same confirmation probes.",
@@ -1388,7 +1374,7 @@ fn issues_from_findings(findings: &[FieldFinding]) -> Vec<DatabaseRiskIssue> {
             findings,
             "time_delay_signal",
             "Time-delay response signal",
-            "medium",
+            WARNING,
             "sql_injection_signal",
             "A time-delay payload caused a noticeably slower response than the baseline. This can indicate time-based SQL injection behavior.",
             "Use parameterized queries and verify the database layer does not execute user-controlled expressions.",
@@ -1400,7 +1386,7 @@ fn issues_from_findings(findings: &[FieldFinding]) -> Vec<DatabaseRiskIssue> {
         findings,
         "status_change_on_quote",
         "Quote payload changed HTTP status",
-        "medium",
+        WARNING,
         "input_handling",
         "A quote payload changed the response status compared with the baseline. This suggests fragile input handling and may hide database errors behind generic 5xx responses.",
         "Validate input types before database access and normalize error handling for malformed parameters.",
@@ -1411,7 +1397,7 @@ fn issues_from_findings(findings: &[FieldFinding]) -> Vec<DatabaseRiskIssue> {
         findings,
         "baseline_unavailable",
         "Baseline request was not usable",
-        "info",
+        WARNING,
         "scan_coverage",
         "The baseline request failed or returned a server error, so some comparisons may be inconclusive.",
         "Re-run the scan with a known-good authenticated request and representative baseline parameters.",
@@ -1438,9 +1424,9 @@ fn push_injection_surface_issue(issues: &mut Vec<DatabaseRiskIssue>, findings: &
     let severity = if !fields_with_signal(findings, "database_error_leak").is_empty()
         || !fields_with_signal(findings, "time_delay_confirmed").is_empty()
     {
-        "high"
+        DANGER
     } else {
-        "medium"
+        WARNING
     };
     let evidence = evidence_for_any_signal(
         findings,
@@ -1464,6 +1450,7 @@ fn push_injection_surface_issue(issues: &mut Vec<DatabaseRiskIssue>, findings: &
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_issue_for_signal(
     issues: &mut Vec<DatabaseRiskIssue>,
     findings: &[FieldFinding],
@@ -1631,7 +1618,7 @@ fn recommendations_for(risk_level: &str) -> Vec<String> {
         "Add integration tests that exercise malicious input for database-backed parameters."
             .to_owned(),
     ];
-    if risk_level != "low" {
+    if risk_level != NORMAL {
         recommendations.push(
             "Review the flagged fields first and validate them against the database query path."
                 .to_owned(),
@@ -1876,7 +1863,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_time_delay_upgrades_field_and_issues_to_high() {
+    fn confirmed_time_delay_upgrades_field_and_issues_to_danger() {
         let baseline = ProbeObservation {
             status: Some(200),
             latency_ms: 80,
@@ -1914,12 +1901,12 @@ mod tests {
         let issues = issues_from_findings(&[finding]);
 
         assert_eq!(issues[0].title, "Possible SQL injection input point");
-        assert_eq!(issues[0].severity, "high");
+        assert_eq!(issues[0].severity, DANGER);
         assert!(
             issues
                 .iter()
                 .any(|issue| issue.title == "Time-based SQL injection confirmed"
-                    && issue.severity == "high")
+                    && issue.severity == DANGER)
         );
         assert!(
             !issues
@@ -1932,22 +1919,22 @@ mod tests {
     fn builds_human_readable_issues_from_database_error_signal() {
         let findings = vec![FieldFinding {
             field: "id".to_owned(),
-            risk: "high".to_owned(),
+            risk: DANGER.to_owned(),
             signals: vec![RiskSignal {
                 kind: "database_error_leak".to_owned(),
-                severity: "high".to_owned(),
+                severity: DANGER.to_owned(),
                 evidence: "response contained database error pattern: sql syntax".to_owned(),
             }],
         }];
 
         let issues = issues_from_findings(&findings);
-        let summary = database_risk_summary("high", 1, issues.len(), &issues);
+        let summary = database_risk_summary(DANGER, 1, issues.len(), &issues);
 
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0].title, "SQL/database error information disclosure");
         assert_eq!(issues[0].affected_fields, vec!["id".to_owned()]);
         assert_eq!(issues[1].title, "Possible SQL injection input point");
-        assert_eq!(issues[1].severity, "high");
+        assert_eq!(issues[1].severity, DANGER);
         assert!(summary.contains("2 issue(s)"));
         assert!(summary.contains("SQL/database error information disclosure (id)"));
         assert!(summary.contains("Possible SQL injection input point (id)"));

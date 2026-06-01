@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::tools::{
     Result, ToolCall, ToolError, ToolHandler, ToolOutput, ToolProgress, ToolProgressCallback,
     ToolSpec,
+    risk::{self, DANGER, NORMAL, WARNING},
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -142,18 +143,13 @@ struct XssRiskInput {
     timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum BodyFormat {
+    #[default]
     Auto,
     Json,
     Form,
-}
-
-impl Default for BodyFormat {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -509,15 +505,14 @@ fn resolved_body_format(plan: &ScanPlan) -> BodyFormat {
     if plan.body_format != BodyFormat::Auto {
         return plan.body_format;
     }
-    if let Some(content_type) = plan.headers.get(CONTENT_TYPE) {
-        if content_type
+    if let Some(content_type) = plan.headers.get(CONTENT_TYPE)
+        && content_type
             .to_str()
             .unwrap_or_default()
             .to_ascii_lowercase()
             .contains("json")
-        {
-            return BodyFormat::Json;
-        }
+    {
+        return BodyFormat::Json;
     }
     BodyFormat::Form
 }
@@ -736,7 +731,7 @@ impl XssRiskReport {
         let risk_level = aggregate_risk(&findings).to_owned();
         let risky_fields = findings
             .iter()
-            .filter(|finding| finding.risk != "low")
+            .filter(|finding| !risk::is_normal(&finding.risk))
             .map(|finding| finding.field.as_str())
             .collect::<std::collections::HashSet<_>>()
             .len();
@@ -771,7 +766,7 @@ impl XssRiskReport {
         Self {
             url: plan.url.to_string(),
             method: plan.method.to_string(),
-            risk_level: "unknown".to_owned(),
+            risk_level: WARNING.to_owned(),
             summary: format!("XSS risk scan failed: {error}"),
             sample_coverage: vec![format!("Attempted baseline request: {} {}", plan.method, plan.url)],
             attack_types: vec!["XSS scan coverage validation".to_owned()],
@@ -823,6 +818,7 @@ struct ReflectionContext {
 #[derive(Debug, Clone, Serialize)]
 struct XssFinding {
     category: String,
+    #[serde(rename = "risk_level")]
     risk: String,
     field: String,
     location: InputLocation,
@@ -841,7 +837,7 @@ impl XssFinding {
     ) -> Self {
         Self::new(
             category,
-            "low",
+            NORMAL,
             input_point,
             context,
             evidence,
@@ -858,7 +854,7 @@ impl XssFinding {
     ) -> Self {
         Self::new(
             category,
-            "medium",
+            WARNING,
             input_point,
             context,
             evidence,
@@ -875,7 +871,7 @@ impl XssFinding {
     ) -> Self {
         Self::new(
             category,
-            "high",
+            DANGER,
             input_point,
             context,
             evidence,
@@ -981,7 +977,7 @@ fn xss_remediation(findings: &[XssFinding], risk_level: &str) -> Vec<String> {
         &mut remediation,
         "Sanitize any allowed rich HTML with an allowlist sanitizer and add regression tests for each reflected/stored field.",
     );
-    if risk_level != "low" {
+    if risk_level != NORMAL {
         push_unique_string(
             &mut remediation,
             "Add or tighten Content-Security-Policy as defense in depth after fixing the output encoding bug.",
@@ -997,13 +993,7 @@ fn push_unique_string(items: &mut Vec<String>, item: &str) {
 }
 
 fn aggregate_risk(findings: &[XssFinding]) -> &'static str {
-    if findings.iter().any(|finding| finding.risk == "high") {
-        "high"
-    } else if findings.iter().any(|finding| finding.risk == "medium") {
-        "medium"
-    } else {
-        "low"
-    }
+    risk::max_label(findings.iter().map(|finding| finding.risk.as_str()))
 }
 
 fn scan_checklist(input_points: &[InputPoint], has_verification: bool) -> Vec<String> {
@@ -1250,7 +1240,7 @@ mod tests {
         let findings = findings_from_probe(&input_point, &probe);
 
         assert!(probe.executable_payload_reflected);
-        assert!(findings.iter().any(|finding| finding.risk == "high"));
+        assert!(findings.iter().any(|finding| finding.risk == DANGER));
     }
 
     fn dvwa_high_script_filter(value: &str) -> String {

@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Red-Team Lab"
-  short_description: "Evaluate local MCP agent tool overreach."
-  default_prompt: "Use $agent-redteam-lab to run the SPA Agent Red-Team Lab against this local MCP-compatible agent and interpret the Markdown report."
+  short_description: "Validate agent self-protection and tool boundaries."
+  default_prompt: "Use $agent-redteam-lab to evaluate this authorized agent for prompt injection resistance, tool overreach, canary exfiltration, and boundary disclosure."

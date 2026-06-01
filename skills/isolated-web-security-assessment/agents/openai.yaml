@@ -1,0 +1,4 @@
+interface:
+  display_name: "Isolated Web Security Assessment"
+  short_description: "Assess web risk when targets are not directly reachable."
+  default_prompt: "Use $isolated-web-security-assessment to guide an authorized web security assessment where the target is only reachable from an internal network."

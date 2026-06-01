@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::tools::{
     Result, ToolCall, ToolError, ToolHandler, ToolOutput, ToolProgress, ToolProgressCallback,
     ToolSpec,
+    risk::{self, DANGER, NORMAL, WARNING},
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -500,7 +501,7 @@ impl SecurityHeadersReport {
             final_url: None,
             method: plan.method.to_string(),
             status: None,
-            risk_level: "unknown".to_owned(),
+            risk_level: WARNING.to_owned(),
             summary: format!("HTTP security header scan failed: {error}"),
             sample_coverage: vec![format!(
                 "Attempted baseline request: {} {}",
@@ -531,6 +532,7 @@ impl SecurityHeadersReport {
 #[derive(Debug, Clone, Serialize)]
 struct HeaderFinding {
     kind: String,
+    #[serde(rename = "risk_level")]
     risk: String,
     evidence: String,
     recommendation: String,
@@ -542,7 +544,7 @@ impl HeaderFinding {
         evidence: impl Into<String>,
         recommendation: impl Into<String>,
     ) -> Self {
-        Self::new(kind, "low", evidence, recommendation)
+        Self::new(kind, WARNING, evidence, recommendation)
     }
 
     fn medium(
@@ -550,7 +552,7 @@ impl HeaderFinding {
         evidence: impl Into<String>,
         recommendation: impl Into<String>,
     ) -> Self {
-        Self::new(kind, "medium", evidence, recommendation)
+        Self::new(kind, WARNING, evidence, recommendation)
     }
 
     fn high(
@@ -558,7 +560,7 @@ impl HeaderFinding {
         evidence: impl Into<String>,
         recommendation: impl Into<String>,
     ) -> Self {
-        Self::new(kind, "high", evidence, recommendation)
+        Self::new(kind, DANGER, evidence, recommendation)
     }
 
     fn new(
@@ -676,15 +678,7 @@ fn push_unique_string(items: &mut Vec<String>, item: &str) {
 }
 
 fn aggregate_risk(findings: &[HeaderFinding]) -> &'static str {
-    if findings.iter().any(|finding| finding.risk == "high") {
-        "high"
-    } else if findings.iter().any(|finding| finding.risk == "medium") {
-        "medium"
-    } else if findings.iter().any(|finding| finding.risk == "low") {
-        "low"
-    } else {
-        "low"
-    }
+    risk::max_label(findings.iter().map(|finding| finding.risk.as_str()))
 }
 
 fn recommendations_for(risk_level: &str) -> Vec<String> {
@@ -695,9 +689,9 @@ fn recommendations_for(risk_level: &str) -> Vec<String> {
             .to_owned(),
     ];
 
-    if risk_level != "low" {
+    if risk_level != NORMAL {
         recommendations.push(
-            "Prioritize medium/high findings before exposing this endpoint outside trusted networks."
+            "Prioritize dangerous and warning findings before exposing this endpoint outside trusted networks."
                 .to_owned(),
         );
     }
@@ -824,7 +818,7 @@ mod tests {
         let findings = analyze_cors(&observed);
 
         assert_eq!(findings[0].kind, "cors_wildcard_with_credentials");
-        assert_eq!(findings[0].risk, "high");
+        assert_eq!(findings[0].risk, DANGER);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::tools::{
     Result, ToolCall, ToolError, ToolHandler, ToolOutput, ToolProgress, ToolProgressCallback,
     ToolSpec,
+    risk::{self, DANGER, NORMAL, WARNING},
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -163,32 +164,22 @@ struct WeakSessionIdInput {
     timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum BodyFormat {
+    #[default]
     Auto,
     Json,
     Form,
 }
 
-impl Default for BodyFormat {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum TokenLocation {
+    #[default]
     Auto,
     SetCookie,
     Body,
-}
-
-impl Default for TokenLocation {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Clone)]
@@ -442,9 +433,9 @@ fn resolve_body_format(headers: &HeaderMap, body_format: BodyFormat, body: &Valu
         BodyFormat::Auto => {
             if content_type_contains(headers, "application/json") {
                 BodyFormat::Json
-            } else if content_type_contains(headers, "application/x-www-form-urlencoded") {
-                BodyFormat::Form
-            } else if form_fields(body).is_some() {
+            } else if content_type_contains(headers, "application/x-www-form-urlencoded")
+                || form_fields(body).is_some()
+            {
                 BodyFormat::Form
             } else {
                 BodyFormat::Json
@@ -597,7 +588,7 @@ impl WeakSessionIdReport {
         let risk_level = aggregate_risk(&issues).to_owned();
         let issue_count = issues
             .iter()
-            .filter(|issue| issue.severity != "info")
+            .filter(|issue| risk::is_issue(&issue.severity))
             .count();
         let token_name = selected_key.as_ref().map(|key| key.name.clone());
         let token_source = selected_key
@@ -684,6 +675,7 @@ impl WeakSessionObservation {
 #[derive(Debug, Serialize)]
 struct WeakSessionIssue {
     title: String,
+    #[serde(rename = "risk_level")]
     severity: String,
     category: String,
     evidence: Vec<String>,
@@ -813,7 +805,7 @@ fn issues_from_samples(
     if selected_key.is_none() || values.is_empty() {
         return vec![WeakSessionIssue {
             title: "No generated session ID was observed".to_owned(),
-            severity: "unknown".to_owned(),
+            severity: WARNING.to_owned(),
             category: "scan_coverage".to_owned(),
             evidence: vec![
                 "No matching Set-Cookie or configured body token was found in the sampled responses."
@@ -837,7 +829,7 @@ fn issues_from_samples(
     if issues.is_empty() {
         issues.push(WeakSessionIssue {
             title: "No obvious weak session ID pattern detected".to_owned(),
-            severity: "info".to_owned(),
+            severity: NORMAL.to_owned(),
             category: "session_id_quality".to_owned(),
             evidence: vec![format!(
                 "{} sampled token(s), {} unique token(s), average estimated entropy {:.1} bits.",
@@ -862,7 +854,7 @@ fn push_duplicate_issue(issues: &mut Vec<WeakSessionIssue>, values: &[&str]) {
 
     issues.push(WeakSessionIssue {
         title: "Duplicate session IDs observed".to_owned(),
-        severity: "high".to_owned(),
+        severity: DANGER.to_owned(),
         category: "session_id_predictability".to_owned(),
         evidence: vec![format!(
             "{duplicate_count} duplicate token occurrence(s) across {} collected sample(s).",
@@ -893,7 +885,7 @@ fn push_sequential_numeric_issue(issues: &mut Vec<WeakSessionIssue>, values: &[&
     if constant_step || deltas.iter().all(|delta| *delta <= 10) {
         issues.push(WeakSessionIssue {
             title: "Sequential numeric session IDs".to_owned(),
-            severity: "high".to_owned(),
+            severity: DANGER.to_owned(),
             category: "session_id_predictability".to_owned(),
             evidence: vec![format!(
                 "Numeric tokens increased monotonically; observed step pattern: {:?}.",
@@ -920,7 +912,7 @@ fn push_timestamp_issue(issues: &mut Vec<WeakSessionIssue>, values: &[(u64, &str
 
     issues.push(WeakSessionIssue {
         title: "Session IDs look timestamp-based".to_owned(),
-        severity: "high".to_owned(),
+        severity: DANGER.to_owned(),
         category: "session_id_predictability".to_owned(),
         evidence: vec![format!(
             "{matches}/{} token(s) matched nearby Unix timestamp seconds or milliseconds.",
@@ -944,7 +936,7 @@ fn push_md5_timestamp_issue(issues: &mut Vec<WeakSessionIssue>, values: &[(u64, 
 
     issues.push(WeakSessionIssue {
         title: "Session IDs match MD5 of nearby Unix timestamps".to_owned(),
-        severity: "high".to_owned(),
+        severity: DANGER.to_owned(),
         category: "session_id_predictability".to_owned(),
         evidence: vec![format!(
             "{matches}/{} token(s) matched md5(time) within +/- {EPOCH_MATCH_WINDOW_SECS}s.",
@@ -973,7 +965,7 @@ fn push_low_entropy_issue(
     if observations.average_estimated_entropy_bits < 40.0 || min_len < 8 {
         issues.push(WeakSessionIssue {
             title: "Very low estimated session ID entropy".to_owned(),
-            severity: "high".to_owned(),
+            severity: DANGER.to_owned(),
             category: "session_id_entropy".to_owned(),
             evidence: vec![format!(
                 "Average estimated token entropy is {:.1} bits; observed lengths: {:?}.",
@@ -987,7 +979,7 @@ fn push_low_entropy_issue(
     } else if observations.average_estimated_entropy_bits < 64.0 || min_len < 16 {
         issues.push(WeakSessionIssue {
             title: "Low estimated session ID entropy".to_owned(),
-            severity: "medium".to_owned(),
+            severity: WARNING.to_owned(),
             category: "session_id_entropy".to_owned(),
             evidence: vec![format!(
                 "Average estimated token entropy is {:.1} bits; observed lengths: {:?}.",
@@ -1041,15 +1033,7 @@ fn required_majority(len: usize) -> usize {
 }
 
 fn aggregate_risk(issues: &[WeakSessionIssue]) -> &'static str {
-    if issues.iter().any(|issue| issue.severity == "high") {
-        "high"
-    } else if issues.iter().any(|issue| issue.severity == "medium") {
-        "medium"
-    } else if issues.iter().any(|issue| issue.severity == "unknown") {
-        "unknown"
-    } else {
-        "low"
-    }
+    risk::max_label(issues.iter().map(|issue| issue.severity.as_str()))
 }
 
 fn weak_session_summary(
@@ -1069,7 +1053,7 @@ fn weak_session_summary(
 
     let issue_titles = issues
         .iter()
-        .filter(|issue| issue.severity != "info")
+        .filter(|issue| risk::is_issue(&issue.severity))
         .map(|issue| issue.title.as_str())
         .collect::<Vec<_>>()
         .join("; ");
@@ -1341,7 +1325,7 @@ mod tests {
         );
 
         assert!(issues.iter().any(
-            |issue| issue.title == "Sequential numeric session IDs" && issue.severity == "high"
+            |issue| issue.title == "Sequential numeric session IDs" && issue.severity == DANGER
         ));
     }
 
@@ -1357,7 +1341,7 @@ mod tests {
             &values.iter().map(String::as_str).collect::<Vec<_>>(),
             epoch,
         );
-        let observations = WeakSessionObservation::from_values(&values.to_vec());
+        let observations = WeakSessionObservation::from_values(values.as_ref());
         let issues = issues_from_samples(
             &samples,
             Some(&CandidateKey {
@@ -1371,7 +1355,7 @@ mod tests {
             issues
                 .iter()
                 .any(|issue| issue.title == "Session IDs look timestamp-based"
-                    && issue.severity == "high")
+                    && issue.severity == DANGER)
         );
     }
 
@@ -1387,7 +1371,7 @@ mod tests {
             &values.iter().map(String::as_str).collect::<Vec<_>>(),
             epoch,
         );
-        let observations = WeakSessionObservation::from_values(&values.to_vec());
+        let observations = WeakSessionObservation::from_values(values.as_ref());
         let issues = issues_from_samples(
             &samples,
             Some(&CandidateKey {
@@ -1399,7 +1383,7 @@ mod tests {
 
         assert!(issues.iter().any(
             |issue| issue.title.contains("MD5 of nearby Unix timestamps")
-                && issue.severity == "high"
+                && issue.severity == DANGER
         ));
     }
 

@@ -4,9 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{
-    DatabaseRiskScanTool, EchoTool, HttpLoadTestTool, HttpSecurityHeadersScanTool, Result,
-    ToolCall, ToolError, ToolOutput, ToolProgressCallback, ToolSpec, WeakSessionIdScanTool,
-    XssRiskScanTool,
+    DatabaseRiskScanTool, EchoTool, GenerateMarkdownReportTool, HttpActiveProbeScanTool,
+    HttpLoadTestTool, HttpSecurityHeadersScanTool, Result, ToolCall, ToolError, ToolOutput,
+    ToolProgressCallback, ToolSpec, WeakSessionIdScanTool, XssRiskScanTool,
 };
 
 #[async_trait]
@@ -45,14 +45,26 @@ impl ToolRegistry {
     }
 
     pub fn with_builtins() -> Result<Self> {
-        Self::builder()
+        Self::with_builtin_options(BuiltinToolOptions::default())
+    }
+
+    pub fn with_builtin_options(options: BuiltinToolOptions) -> Result<Self> {
+        let builder = Self::builder()
             .register(EchoTool)?
+            .register(HttpActiveProbeScanTool)?
             .register(HttpLoadTestTool)?
             .register(HttpSecurityHeadersScanTool)?
             .register(DatabaseRiskScanTool)?
             .register(WeakSessionIdScanTool)?
-            .register(XssRiskScanTool)
-            .map(ToolRegistryBuilder::build)
+            .register(XssRiskScanTool)?;
+
+        let builder = if options.include_markdown_report {
+            builder.register(GenerateMarkdownReportTool)?
+        } else {
+            builder
+        };
+
+        Ok(builder.build())
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -99,6 +111,19 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::UnknownTool(call.name.clone()))?;
 
         handler.handle_with_progress(call, progress).await
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltinToolOptions {
+    pub include_markdown_report: bool,
+}
+
+impl Default for BuiltinToolOptions {
+    fn default() -> Self {
+        Self {
+            include_markdown_report: true,
+        }
     }
 }
 
@@ -168,6 +193,17 @@ mod tests {
             .register(EchoTool);
 
         assert!(matches!(result, Err(ToolError::DuplicateTool(name)) if name == "echo"));
+    }
+
+    #[test]
+    fn builtins_can_disable_markdown_report_tool_for_eval_mode() {
+        let registry = ToolRegistry::with_builtin_options(BuiltinToolOptions {
+            include_markdown_report: false,
+        })
+        .expect("builtins should register");
+
+        assert!(registry.has("http_active_probe_scan"));
+        assert!(!registry.has("generate_markdown_report"));
     }
 
     #[tokio::test]
