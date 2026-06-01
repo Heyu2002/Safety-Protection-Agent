@@ -8,7 +8,9 @@ mod spec;
 pub use error::{Result, ToolError};
 pub use handlers::{
     DatabaseRiskScanTool, EchoTool, GenerateMarkdownReportTool, HttpActiveProbeScanTool,
-    HttpLoadTestTool, HttpSecurityHeadersScanTool, WeakSessionIdScanTool, XssRiskScanTool,
+    HttpLoadTestTool, HttpSecurityHeadersScanTool, JavaCryptoSemanticScanTool,
+    JavaInjectionSemanticScanTool, JavaRandomnessSemanticScanTool, WeakSessionIdScanTool,
+    XssRiskScanTool,
 };
 pub use registry::{BuiltinToolOptions, ToolHandler, ToolRegistry, ToolRegistryBuilder};
 pub use router::ToolRouter;

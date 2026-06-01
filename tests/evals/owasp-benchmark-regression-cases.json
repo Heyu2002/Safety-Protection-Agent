@@ -1,0 +1,122 @@
+[
+  {
+    "id": "BenchmarkTest00007",
+    "category": "cmdi",
+    "expected_vulnerable": "true",
+    "cwe": "78",
+    "method": "GET",
+    "path": "/BenchmarkTest00007",
+    "params": {},
+    "notes": "Regression case from the 30-case comparison: SPA false negative."
+  },
+  {
+    "id": "BenchmarkTest00008",
+    "category": "sqli",
+    "expected_vulnerable": "true",
+    "cwe": "89",
+    "method": "GET",
+    "path": "/BenchmarkTest00008",
+    "params": {},
+    "notes": "Regression case from the 30-case comparison: SPA inconclusive on a vulnerable case."
+  },
+  {
+    "id": "BenchmarkTest00009",
+    "category": "hash",
+    "expected_vulnerable": "false",
+    "cwe": "328",
+    "method": "GET",
+    "path": "/BenchmarkTest00009",
+    "params": {},
+    "notes": "Regression case from the 30-case comparison: SPA false positive."
+  },
+  {
+    "id": "BenchmarkTest00010",
+    "category": "weakrand",
+    "expected_vulnerable": "false",
+    "cwe": "330",
+    "method": "GET",
+    "path": "/BenchmarkTest00010",
+    "params": {},
+    "notes": "Priority P0 coverage: SecureRandom should not be treated as weak randomness."
+  },
+  {
+    "id": "BenchmarkTest00023",
+    "category": "weakrand",
+    "expected_vulnerable": "true",
+    "cwe": "330",
+    "method": "GET",
+    "path": "/BenchmarkTest00023",
+    "params": {},
+    "notes": "Priority P0 coverage: java.util.Random should be treated as weak randomness."
+  },
+  {
+    "id": "BenchmarkTest00013",
+    "category": "xss",
+    "expected_vulnerable": "true",
+    "cwe": "79",
+    "method": "GET",
+    "path": "/BenchmarkTest00013",
+    "params": {},
+    "notes": "Regression case from the 30-case comparison: SPA false negative."
+  },
+  {
+    "id": "BenchmarkTest00052",
+    "category": "sqli",
+    "expected_vulnerable": "false",
+    "cwe": "89",
+    "method": "GET",
+    "path": "/BenchmarkTest00052",
+    "params": {},
+    "notes": "Regression case from the 30-case comparison: SPA inconclusive on a non-vulnerable case."
+  },
+  {
+    "id": "BenchmarkTest00054",
+    "category": "crypto",
+    "expected_vulnerable": "false",
+    "cwe": "327",
+    "method": "GET",
+    "path": "/BenchmarkTest00054",
+    "params": {},
+    "notes": "Regression case from the 30-case comparison: SPA inconclusive on a non-vulnerable case."
+  },
+  {
+    "id": "BenchmarkTest00097",
+    "category": "trustbound",
+    "expected_vulnerable": "false",
+    "cwe": "501",
+    "method": "GET",
+    "path": "/BenchmarkTest00097",
+    "params": {},
+    "notes": "Regression case from the 30-case comparison: SPA false positive."
+  },
+  {
+    "id": "BenchmarkTest00118",
+    "category": "xpathi",
+    "expected_vulnerable": "false",
+    "cwe": "643",
+    "method": "GET",
+    "path": "/BenchmarkTest00118",
+    "params": {},
+    "notes": "Priority P1 coverage: constant XPath expression value should be treated as non-vulnerable."
+  },
+  {
+    "id": "BenchmarkTest00207",
+    "category": "xpathi",
+    "expected_vulnerable": "true",
+    "cwe": "643",
+    "method": "GET",
+    "path": "/BenchmarkTest00207",
+    "params": {},
+    "notes": "Priority P1 coverage: header vector taint reaches XPath evaluate."
+  },
+  {
+    "id": "BenchmarkTest00138",
+    "category": "ldapi",
+    "expected_vulnerable": "false",
+    "cwe": "90",
+    "method": "GET",
+    "path": "/BenchmarkTest00138",
+    "params": {},
+    "notes": "Regression case from the 30-case comparison: SPA inconclusive on a non-vulnerable case."
+  }
+]

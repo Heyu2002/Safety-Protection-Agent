@@ -22,6 +22,7 @@ const DEFAULT_TIME_CONFIRMATION_RUNS: u64 = 2;
 const MAX_TIME_CONFIRMATION_RUNS: u64 = 3;
 const MAX_FIELDS: usize = 12;
 const BODY_PREVIEW_LIMIT: usize = 2_000;
+const HEADER_FIELD_PREFIX: &str = "header:";
 
 #[derive(Debug, Clone, Copy)]
 pub struct DatabaseRiskScanTool;
@@ -75,6 +76,11 @@ impl ToolHandler for DatabaseRiskScanTool {
                     "injectable_fields": {
                         "type": "array",
                         "description": "Parameter or top-level JSON body field names to test. Defaults to detected URL query/body fields.",
+                        "items": { "type": "string" }
+                    },
+                    "injectable_headers": {
+                        "type": "array",
+                        "description": "Request header names to test as database input points, such as vector, Referer, or X-Forwarded-For.",
                         "items": { "type": "string" }
                     },
                     "include_time_based": {
@@ -165,6 +171,8 @@ struct DatabaseRiskInput {
     body_format: BodyFormat,
     #[serde(default)]
     injectable_fields: Option<Vec<String>>,
+    #[serde(default)]
+    injectable_headers: Option<Vec<String>>,
     #[serde(default = "default_include_time_based")]
     include_time_based: bool,
     #[serde(default = "default_confirm_time_based")]
@@ -244,16 +252,17 @@ impl DatabaseRiskInput {
             headers.insert(name, value);
         }
 
-        let fields = selected_fields(
+        let mut fields = selected_fields(
             &url,
             &self.query_params,
             self.body.as_ref(),
             self.injectable_fields,
         );
+        append_header_fields(tool, &mut fields, self.injectable_headers)?;
         if fields.len() > MAX_FIELDS {
             return Err(invalid(
                 tool,
-                format!("injectable_fields must contain at most {MAX_FIELDS} fields"),
+                format!("injectable input points must contain at most {MAX_FIELDS} fields"),
             ));
         }
 
@@ -289,6 +298,7 @@ impl DatabaseRiskInput {
 
 async fn run_scan(plan: ScanPlan, progress: Option<ToolProgressCallback>) -> DatabaseRiskReport {
     let client = Client::builder()
+        .danger_accept_invalid_certs(true)
         .timeout(Duration::from_millis(plan.timeout_ms))
         .build()
         .unwrap_or_else(|_| Client::new());
@@ -411,19 +421,33 @@ async fn send_probe_request(
     let started = tokio::time::Instant::now();
     let mut url = plan.url.clone();
     apply_query_params(&mut url, &plan.query_params);
+    let mut headers = plan.headers.clone();
 
     let mut body = plan.body.clone();
     if let (Some(field), Some(payload)) = (field, payload) {
-        if mutates_body_field(body.as_mut(), field, payload) {
+        if let Some(header_name) = header_probe_name(field) {
+            match HeaderValue::from_str(payload) {
+                Ok(value) => {
+                    headers.insert(header_name, value);
+                }
+                Err(error) => {
+                    return ProbeObservation {
+                        status: None,
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        body_len: 0,
+                        body_preview: String::new(),
+                        error: Some(format!("invalid probe header value for {field}: {error}")),
+                    };
+                }
+            }
+        } else if mutates_body_field(body.as_mut(), field, payload) {
             // Body field was mutated.
         } else {
             upsert_query_param(&mut url, field, payload);
         }
     }
 
-    let mut request = client
-        .request(plan.method.clone(), url)
-        .headers(plan.headers.clone());
+    let mut request = client.request(plan.method.clone(), url).headers(headers);
     if let Some(body) = body {
         request = apply_body(request, &plan.headers, plan.body_format, &body);
     }
@@ -925,6 +949,13 @@ fn push_boolean_pair(
 }
 
 fn field_value(plan: &ScanPlan, field: &str) -> Option<String> {
+    if let Some(header_name) = header_probe_name(field) {
+        return plan
+            .headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+    }
     if let Some(value) = plan
         .body
         .as_ref()
@@ -980,6 +1011,32 @@ fn selected_fields(
     }
 
     fields
+}
+
+fn append_header_fields(
+    tool: &str,
+    fields: &mut Vec<String>,
+    requested: Option<Vec<String>>,
+) -> Result<()> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    for header in requested {
+        let header = header.trim();
+        if header.is_empty() {
+            continue;
+        }
+        let name = HeaderName::from_str(header).map_err(|error| {
+            invalid(tool, format!("invalid injectable header {header}: {error}"))
+        })?;
+        push_unique(fields, format!("{HEADER_FIELD_PREFIX}{}", name.as_str()));
+    }
+    Ok(())
+}
+
+fn header_probe_name(field: &str) -> Option<HeaderName> {
+    let header = field.strip_prefix(HEADER_FIELD_PREFIX)?;
+    HeaderName::from_str(header).ok()
 }
 
 fn push_unique(items: &mut Vec<String>, item: String) {
@@ -1745,6 +1802,38 @@ mod tests {
         let fields = selected_fields(&url, &HashMap::new(), Some(&body), None);
 
         assert_eq!(fields, vec!["id".to_owned(), "name".to_owned()]);
+    }
+
+    #[test]
+    fn builds_header_fields_from_injectable_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("Vector".to_owned(), "lookupUsers".to_owned());
+        let input = DatabaseRiskInput {
+            url: "https://target.example/search".to_owned(),
+            verification_url: None,
+            method: "GET".to_owned(),
+            headers,
+            query_params: HashMap::new(),
+            body: None,
+            body_format: BodyFormat::Auto,
+            injectable_fields: None,
+            injectable_headers: Some(vec!["Vector".to_owned()]),
+            include_time_based: true,
+            confirm_time_based: true,
+            time_confirmation_runs: DEFAULT_TIME_CONFIRMATION_RUNS,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            max_time_delay_ms: DEFAULT_TIME_DELAY_MS,
+        };
+
+        let plan = input
+            .into_plan("database_risk_scan")
+            .expect("plan should build");
+
+        assert_eq!(plan.fields, vec!["header:vector".to_owned()]);
+        assert_eq!(
+            field_value(&plan, "header:vector"),
+            Some("lookupUsers".to_owned())
+        );
     }
 
     #[test]

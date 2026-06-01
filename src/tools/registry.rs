@@ -5,8 +5,9 @@ use async_trait::async_trait;
 
 use super::{
     DatabaseRiskScanTool, EchoTool, GenerateMarkdownReportTool, HttpActiveProbeScanTool,
-    HttpLoadTestTool, HttpSecurityHeadersScanTool, Result, ToolCall, ToolError, ToolOutput,
-    ToolProgressCallback, ToolSpec, WeakSessionIdScanTool, XssRiskScanTool,
+    HttpLoadTestTool, HttpSecurityHeadersScanTool, JavaCryptoSemanticScanTool,
+    JavaInjectionSemanticScanTool, JavaRandomnessSemanticScanTool, Result, ToolCall, ToolError,
+    ToolOutput, ToolProgressCallback, ToolSpec, WeakSessionIdScanTool, XssRiskScanTool,
 };
 
 #[async_trait]
@@ -54,6 +55,9 @@ impl ToolRegistry {
             .register(HttpActiveProbeScanTool)?
             .register(HttpLoadTestTool)?
             .register(HttpSecurityHeadersScanTool)?
+            .register(JavaCryptoSemanticScanTool)?
+            .register(JavaInjectionSemanticScanTool)?
+            .register(JavaRandomnessSemanticScanTool)?
             .register(DatabaseRiskScanTool)?
             .register(WeakSessionIdScanTool)?
             .register(XssRiskScanTool)?;

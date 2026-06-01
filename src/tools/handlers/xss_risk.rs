@@ -31,7 +31,7 @@ impl ToolHandler for XssRiskScanTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             self.name(),
-            "Probe an authorized HTTP endpoint for reflected or stored XSS risk using unique markers and low-impact browser payloads. Requires at least one testable query/body field.",
+            "Probe an authorized HTTP endpoint for reflected or stored XSS risk using unique markers and low-impact browser payloads. Requires at least one testable query, body, or header input point.",
             json!({
                 "type": "object",
                 "properties": {
@@ -67,6 +67,11 @@ impl ToolHandler for XssRiskScanTool {
                     "injectable_fields": {
                         "type": "array",
                         "description": "Optional field names to test. If omitted, existing query/body fields are tested.",
+                        "items": { "type": "string" }
+                    },
+                    "injectable_headers": {
+                        "type": "array",
+                        "description": "Optional request header names to test as XSS input points, such as Referer, User-Agent, or X-Forwarded-For.",
                         "items": { "type": "string" }
                     },
                     "verification_urls": {
@@ -138,6 +143,8 @@ struct XssRiskInput {
     #[serde(default)]
     injectable_fields: Vec<String>,
     #[serde(default)]
+    injectable_headers: Vec<String>,
+    #[serde(default)]
     verification_urls: Vec<String>,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
@@ -177,6 +184,7 @@ struct InputPoint {
 #[serde(rename_all = "snake_case")]
 enum InputLocation {
     Query,
+    Header,
     Body,
 }
 
@@ -238,10 +246,12 @@ impl XssRiskInput {
         let input_points = input_points_for(
             tool,
             &method,
+            &headers,
             &query_values,
             &body_values,
             raw_body.as_ref(),
             &self.injectable_fields,
+            &self.injectable_headers,
         )?;
 
         Ok(ScanPlan {
@@ -262,10 +272,12 @@ impl XssRiskInput {
 fn input_points_for(
     tool: &str,
     method: &Method,
+    headers: &HeaderMap,
     query_values: &BTreeMap<String, String>,
     body_values: &BTreeMap<String, String>,
     raw_body: Option<&String>,
     injectable_fields: &[String],
+    injectable_headers: &[String],
 ) -> Result<Vec<InputPoint>> {
     let mut points = Vec::new();
 
@@ -313,14 +325,47 @@ fn input_points_for(
             }
         }
     }
+    for header in injectable_headers {
+        if let Some(input_point) = header_input_point(tool, headers, header)? {
+            points.push(input_point);
+        }
+    }
 
     if points.is_empty() {
         return Err(invalid(
             tool,
-            "xss_risk_scan needs at least one testable input point: query params in the URL, query_params, object body fields, or injectable_fields",
+            "xss_risk_scan needs at least one testable input point: query params in the URL, query_params, object body fields, injectable_fields, or injectable_headers",
         ));
     }
     Ok(points)
+}
+
+fn header_input_point(
+    tool: &str,
+    headers: &HeaderMap,
+    raw_name: &str,
+) -> Result<Option<InputPoint>> {
+    let raw_name = raw_name.trim();
+    if raw_name.is_empty() {
+        return Ok(None);
+    }
+    let name = HeaderName::from_str(raw_name).map_err(|error| {
+        invalid(
+            tool,
+            format!("invalid injectable header {raw_name}: {error}"),
+        )
+    })?;
+    let baseline_value = headers
+        .get(&name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+
+    Ok(Some(InputPoint {
+        location: InputLocation::Header,
+        name: name.as_str().to_owned(),
+        baseline_value,
+    }))
 }
 
 async fn run_scan(plan: ScanPlan, progress: Option<ToolProgressCallback>) -> XssRiskReport {
@@ -330,6 +375,7 @@ async fn run_scan(plan: ScanPlan, progress: Option<ToolProgressCallback>) -> Xss
     emit_progress(progress.as_ref(), completed, total, &checklist);
 
     let client = match Client::builder()
+        .danger_accept_invalid_certs(true)
         .timeout(Duration::from_millis(plan.timeout_ms))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
@@ -446,6 +492,7 @@ async fn send_request(
 ) -> std::result::Result<ObservedResponse, String> {
     let mut url = plan.url.clone();
     let mut query_values = plan.query_values.clone();
+    let mut headers = plan.headers.clone();
     let mut body_values = plan.body_values.clone();
     let mut raw_body = plan.raw_body.clone();
 
@@ -453,6 +500,18 @@ async fn send_request(
         match probe.input_point.location {
             InputLocation::Query => {
                 query_values.insert(probe.input_point.name.clone(), probe.value);
+            }
+            InputLocation::Header => {
+                let name = HeaderName::from_str(&probe.input_point.name).map_err(|error| {
+                    format!("invalid probe header {}: {error}", probe.input_point.name)
+                })?;
+                let value = HeaderValue::from_str(&probe.value).map_err(|error| {
+                    format!(
+                        "invalid probe header value for {}: {error}",
+                        probe.input_point.name
+                    )
+                })?;
+                headers.insert(name, value);
             }
             InputLocation::Body => {
                 if raw_body.is_none() {
@@ -470,7 +529,7 @@ async fn send_request(
     }
 
     let mut request = client.request(plan.method.clone(), url);
-    request = request.headers(plan.headers.clone());
+    request = request.headers(headers);
 
     if !matches!(plan.method, Method::GET) {
         if let Some(raw) = raw_body.take() {
@@ -666,9 +725,16 @@ fn findings_from_probe(input_point: &InputPoint, probe: &XssProbe) -> Vec<XssFin
 
 fn reflection_contexts(body: &str, marker: &str) -> Vec<ReflectionContext> {
     let mut contexts = Vec::new();
+    if marker.is_empty() {
+        return contexts;
+    }
+
     for (index, _) in body.match_indices(marker).take(5) {
-        let start = index.saturating_sub(CONTEXT_PREVIEW_BYTES);
-        let end = (index + marker.len() + CONTEXT_PREVIEW_BYTES).min(body.len());
+        let start = floor_char_boundary(body, index.saturating_sub(CONTEXT_PREVIEW_BYTES));
+        let end = ceil_char_boundary(
+            body,
+            (index + marker.len() + CONTEXT_PREVIEW_BYTES).min(body.len()),
+        );
         let preview = body[start..end].replace('\n', "\\n");
         contexts.push(ReflectionContext {
             context: classify_context(&body[..index]),
@@ -676,6 +742,22 @@ fn reflection_contexts(body: &str, marker: &str) -> Vec<ReflectionContext> {
         });
     }
     contexts
+}
+
+fn floor_char_boundary(value: &str, index: usize) -> usize {
+    let mut index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(value: &str, index: usize) -> usize {
+    let mut index = index.min(value.len());
+    while index < value.len() && !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 fn classify_context(before: &str) -> String {
@@ -1189,6 +1271,21 @@ mod tests {
     }
 
     #[test]
+    fn reflection_context_preview_handles_multibyte_boundaries() {
+        let marker = "spa-xss-field";
+        let prefix = format!("{}{}", "成", "a".repeat(118));
+        let suffix = format!("{}{}z", "a".repeat(119), "成");
+        let body = format!("<html><body>{prefix}{marker}{suffix}</body></html>");
+
+        let contexts = reflection_contexts(&body, marker);
+
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].context, "html_text");
+        assert!(contexts[0].preview.contains(marker));
+        assert!(contexts[0].preview.contains("成"));
+    }
+
+    #[test]
     fn detects_executable_payload_reflection() {
         let input_point = InputPoint {
             location: InputLocation::Query,
@@ -1243,6 +1340,38 @@ mod tests {
         assert!(findings.iter().any(|finding| finding.risk == DANGER));
     }
 
+    #[test]
+    fn builds_header_input_points_from_injectable_headers() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Referer".to_owned(),
+            "https://source.example/page".to_owned(),
+        );
+        let input = XssRiskInput {
+            url: "https://target.example/echo".to_owned(),
+            method: "GET".to_owned(),
+            headers,
+            query_params: BTreeMap::new(),
+            body: None,
+            body_format: BodyFormat::Auto,
+            injectable_fields: Vec::new(),
+            injectable_headers: vec!["Referer".to_owned()],
+            verification_urls: Vec::new(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        };
+
+        let plan = input.into_plan("xss_risk_scan").expect("plan should build");
+
+        assert_eq!(
+            plan.input_points,
+            vec![InputPoint {
+                location: InputLocation::Header,
+                name: "referer".to_owned(),
+                baseline_value: "https://source.example/page".to_owned(),
+            }]
+        );
+    }
+
     fn dvwa_high_script_filter(value: &str) -> String {
         value
             .replace("<script", "")
@@ -1263,6 +1392,7 @@ mod tests {
             body: None,
             body_format: BodyFormat::Auto,
             injectable_fields: Vec::new(),
+            injectable_headers: Vec::new(),
             verification_urls: Vec::new(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
         };

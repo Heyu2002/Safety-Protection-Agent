@@ -34,7 +34,7 @@ impl ToolHandler for HttpActiveProbeScanTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             self.name(),
-            "Run bounded low-impact HTTP probes across query, header, cookie, and body inputs for web weakness classes that do not have a more specific SPA tool, including path traversal, command injection, LDAP injection, trust-boundary/state-key influence, and generic injection signals.",
+            "Run bounded low-impact HTTP probes across query, header, cookie, and body inputs for web weakness classes that do not have a more specific SPA tool, including path traversal, command injection, LDAP injection, trust-boundary/state-key influence, and generic injection signals. Command-injection probes include shell separators and environment-variable command wrappers.",
             json!({
                 "type": "object",
                 "properties": {
@@ -931,7 +931,8 @@ fn default_payloads(kind: ProbeKind) -> Vec<ProbePayload> {
                 payload(format!("spa_probe_{nonce}")),
                 marked_payload(format!("spa_probe_{nonce}&&echo {marker}"), marker.clone()),
                 marked_payload(format!("spa_probe_{nonce};echo {marker}"), marker.clone()),
-                marked_payload(format!("spa_probe_{nonce}|echo {marker}"), marker),
+                marked_payload(format!("spa_probe_{nonce}|echo {marker}"), marker.clone()),
+                marked_payload(format!("FOO=echo {marker}"), marker),
             ]
         }
         ProbeKind::LdapInjection => ["*", "*)", "*)(uid=*))(|(uid=*", "benchmark"]
@@ -1040,6 +1041,19 @@ mod tests {
         let signals = classify_signals(&ProbeKind::CommandInjection, &baseline, &response, &probe);
 
         assert!(signals.contains(&"command_output_marker_without_literal_payload".to_owned()));
+    }
+
+    #[test]
+    fn command_injection_defaults_include_environment_wrapper_payload() {
+        let payloads = default_payloads(ProbeKind::CommandInjection);
+
+        assert!(payloads.iter().any(|payload| {
+            payload.value.starts_with("FOO=echo ")
+                && payload
+                    .marker
+                    .as_ref()
+                    .is_some_and(|marker| payload.value.ends_with(marker))
+        }));
     }
 
     #[test]

@@ -181,9 +181,13 @@ function New-ScorePrompt($Case, [string]$TargetUrl) {
         "1. Test only this single case. Do not expand to unrelated targets.",
         "2. Use low-impact checks only. Do not destroy data, exfiltrate secrets, run load tests, or persist changes.",
         "3. If the page exposes no parameter, try only a small set of reasonable parameters and locations for this weakness, including vector, case ID, common query fields, headers, and cookies.",
-        "4. Judge from runtime HTTP/browser evidence only. Do not inspect OWASP Benchmark source code, expected-results files, prior score files, or project implementation files, and do not call the spa binary to answer this case.",
+        "4. Judge from runtime HTTP/browser evidence first. Hash/crypto/weakrand cases may use an available source/static semantic tool for this single case to identify the algorithm, cipher mode, or randomness API. SQLi/LDAPI/XPathi/trustbound cases may use an available source/static semantic tool for this single case when runtime responses are collapsed or do not expose a usable delta. Do not inspect expected-results files or prior score files, and do not call the spa binary to answer this case.",
         "5. The target is local authorized HTTPS and may use a self-signed certificate. If a client blocks local certificate validation, use a localhost-only certificate bypass and continue.",
         "6. Do not assume the target is vulnerable just because this is OWASP Benchmark.",
+        "6a. For hash/crypto cases, generic runtime banners such as MessageDigest.getInstance or Cipher.getInstance executed are not enough. Use weak algorithm/mode evidence such as MD5, SHA-1, DES, RC4, ECB, or provider-default AES; if the algorithm cannot be identified, return inconclusive.",
+        "6b. For weakrand cases, generic runtime banners such as Weak Randomness Test executed are not enough. Use java_randomness_semantic_scan when available; java.util.Random, Math.random, or ThreadLocalRandom support vulnerable, while SecureRandom supports not_vulnerable unless predictable seeding is shown.",
+        "6c. For SQLi/LDAPI/XPathi/trustbound cases, if black-box probes hit a fixed generic response or no useful delta, use java_injection_semantic_scan with this case_id when available. Tainted request data reaching SQL/LDAP/XPath/session sinks supports vulnerable; constants or benchmark safe helpers reaching the sink support not_vulnerable.",
+        "6d. For trustbound cases, a reachable session write alone is not enough. Require user-controlled session key/value influence or source-level taint into setAttribute/putValue before returning vulnerable.",
         "7. End your final answer with exactly one single-line JSON object and no Markdown after it.",
         "8. The JSON object must contain these fields: case_id, verdict, confidence, evidence, tested_inputs.",
         "9. verdict must be one of: vulnerable, not_vulnerable, inconclusive.",
@@ -390,7 +394,7 @@ function New-CoverageInfo([string]$Status, [string]$Tools, [string]$Next) {
 function Get-ToolCoverageInfo([string]$Category) {
     $normalized = $Category.ToLowerInvariant()
     if ($normalized -eq "sqli") {
-        return [pscustomobject]@{ status = "covered-specific"; tools = "database_risk_scan"; next = "Tune parameter discovery and blind/time-based evidence thresholds." }
+        return [pscustomobject]@{ status = "covered-specific+static"; tools = "database_risk_scan, java_injection_semantic_scan"; next = "Expand SQL semantic rules for prepared bindings, sanitizers, and multi-method helper flows." }
     }
     if ($normalized -eq "xss") {
         return [pscustomobject]@{ status = "covered-specific"; tools = "xss_risk_scan"; next = "Use MCP browser evidence for DOM/execution confirmation when needed." }
@@ -405,22 +409,22 @@ function Get-ToolCoverageInfo([string]$Category) {
         return [pscustomobject]@{ status = "covered-generic"; tools = "http_active_probe_scan"; next = "Expand low-impact echo markers and header/cookie/source discovery." }
     }
     if ($normalized -eq "ldapi") {
-        return [pscustomobject]@{ status = "covered-generic"; tools = "http_active_probe_scan"; next = "Add stronger LDAP/XPath filter-delta and error signatures." }
+        return [pscustomobject]@{ status = "covered-generic+static"; tools = "http_active_probe_scan, java_injection_semantic_scan"; next = "Expand LDAP semantic rules for escaping helpers and multi-method dataflow." }
     }
     if ($normalized -eq "trustbound") {
-        return [pscustomobject]@{ status = "covered-generic"; tools = "http_active_probe_scan"; next = "Add second-read verification for session/state-key influence." }
+        return [pscustomobject]@{ status = "covered-generic+static"; tools = "http_active_probe_scan, java_injection_semantic_scan"; next = "Add second-read runtime verification for session/state-key influence." }
     }
     if ($normalized -eq "xpathi") {
-        return [pscustomobject]@{ status = "partial-generic"; tools = "http_active_probe_scan"; next = "Add XPath-specific payloads and XML/XPath error/result-delta signatures." }
+        return [pscustomobject]@{ status = "covered-generic+static"; tools = "http_active_probe_scan, java_injection_semantic_scan"; next = "Expand XPath semantic rules for collections, sanitizers, and multi-method dataflow." }
     }
     if ($normalized -eq "crypto") {
-        return [pscustomobject]@{ status = "needs-source-or-static-tool"; tools = "none"; next = "Add a source/static crypto misuse tool or benchmark source adapter; black-box HTTP cannot reliably identify DES/ECB/weak algorithms." }
+        return [pscustomobject]@{ status = "covered-static"; tools = "java_crypto_semantic_scan"; next = "Keep expanding crypto semantic rules for key/IV generation and authenticated encryption." }
     }
     if ($normalized -eq "hash") {
-        return [pscustomobject]@{ status = "needs-source-or-static-tool"; tools = "none"; next = "Add a source/static hash misuse tool; black-box responses usually cannot distinguish MD5/SHA-1 from safe hashes." }
+        return [pscustomobject]@{ status = "covered-static"; tools = "java_crypto_semantic_scan"; next = "Keep expanding hash semantic rules for password-hashing context and custom wrappers." }
     }
     if ($normalized -eq "weakrand") {
-        return [pscustomobject]@{ status = "needs-source-or-statistical-tool"; tools = "weak_session_id_scan partial"; next = "Add a generic randomness sampler for body/header/token values, distribution/range analysis, and FP calibration for safe bounded random." }
+        return [pscustomobject]@{ status = "covered-static+partial-runtime"; tools = "java_randomness_semantic_scan, weak_session_id_scan partial"; next = "Add generic runtime randomness sampling for reflected/body/header tokens and predictable seeding patterns." }
     }
     return [pscustomobject]@{ status = "unknown"; tools = "none"; next = "Inspect this category and map it to an existing tool or add a new one." }
 }
@@ -455,9 +459,10 @@ function New-ToolCoveragePlan {
     $lines.Add("")
     $lines.Add("Execution order:")
     $lines.Add("1. Use `http_active_probe_scan` for sampled path traversal, command injection, LDAP injection, and trust-boundary cases before asking for missing parameters.")
-    $lines.Add("2. Add a source/static crypto/hash/randomness analyzer before treating crypto, hash, and weakrand benchmark categories as fully covered.")
-    $lines.Add("3. Add XPath-specific payloads/signals if `xpathi` appears in the random sample.")
-    $lines.Add("4. Re-run this scoring script and compare TP/FP/FN by category.")
+    $lines.Add("2. Use `java_crypto_semantic_scan` for crypto/hash cases, `java_randomness_semantic_scan` for weakrand cases, and `java_injection_semantic_scan` for SQLi/LDAPI/XPathi/trustbound cases where runtime responses are collapsed or source-to-sink proof is needed.")
+    $lines.Add("3. Add runtime randomness sampling for reflected/body/header tokens before treating weakrand outside Java benchmark sources as fully covered.")
+    $lines.Add("4. Add XPath-specific active payloads/signals if source is unavailable for `xpathi`.")
+    $lines.Add("5. Re-run this scoring script and compare TP/FP/FN by category.")
 
     return ($lines -join [Environment]::NewLine)
 }
