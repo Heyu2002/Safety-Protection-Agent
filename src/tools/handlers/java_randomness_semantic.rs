@@ -253,9 +253,7 @@ fn contains_math_random(source: &str) -> bool {
 }
 
 fn contains_java_util_random(source: &str) -> bool {
-    source.contains("new java.util.Random(")
-        || source.contains("new Random(")
-        || source.contains("java.util.Random ")
+    source.contains("new java.util.Random(") || source.contains("new Random(")
 }
 
 fn contains_thread_local_random(source: &str) -> bool {
@@ -336,9 +334,7 @@ mod tests {
 
     #[test]
     fn classifies_math_random_as_weak() {
-        let findings = analyze_java_randomness_source(
-            r#"double value = java.lang.Math.random();"#,
-        );
+        let findings = analyze_java_randomness_source(r#"double value = java.lang.Math.random();"#);
 
         assert_eq!(findings[0].risk_level, DANGER);
         assert_eq!(findings[0].category, "weak_randomness_api");
@@ -346,9 +342,8 @@ mod tests {
 
     #[test]
     fn classifies_java_util_random_as_weak() {
-        let findings = analyze_java_randomness_source(
-            r#"float rand = new java.util.Random().nextFloat();"#,
-        );
+        let findings =
+            analyze_java_randomness_source(r#"float rand = new java.util.Random().nextFloat();"#);
 
         assert_eq!(findings[0].risk_level, DANGER);
         assert_eq!(findings[0].api, "java.util.Random");
@@ -360,6 +355,17 @@ mod tests {
             r#"int randNumber = java.security.SecureRandom.getInstance("SHA1PRNG").nextInt(99);"#,
         );
 
+        assert_eq!(findings[0].risk_level, NORMAL);
+        assert_eq!(findings[0].api, "java.security.SecureRandom");
+    }
+
+    #[test]
+    fn declared_random_type_backed_by_secure_random_is_not_weak() {
+        let findings = analyze_java_randomness_source(
+            r#"java.util.Random numGen = java.security.SecureRandom.getInstance("SHA1PRNG");"#,
+        );
+
+        assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk_level, NORMAL);
         assert_eq!(findings[0].api, "java.security.SecureRandom");
     }

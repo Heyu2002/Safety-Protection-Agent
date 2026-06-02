@@ -42,6 +42,13 @@ mod tests {
         assert!(DEFAULT_SYSTEM_PROMPT.contains("Favor recall"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("bounded low-impact probes"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("stopping at doubt"));
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("assume a plausible vulnerability hypothesis first")
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT
+                .contains("If validation cannot be completed, return inconclusive instead of safe")
+        );
     }
 
     #[test]

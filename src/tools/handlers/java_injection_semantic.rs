@@ -108,16 +108,23 @@ enum ValueState {
     Unknown,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct JavaState {
     strings: HashMap<String, ValueState>,
     ints: HashMap<String, i64>,
+    lists: HashMap<String, Vec<ValueState>>,
+    maps: HashMap<String, HashMap<String, ValueState>>,
+    builders: HashMap<String, ValueState>,
+    methods: HashMap<String, JavaStringMethod>,
 }
 
-fn run_scan(
-    input: JavaInjectionSemanticInput,
-    tool: &str,
-) -> Result<JavaInjectionSemanticReport> {
+#[derive(Debug, Clone)]
+struct JavaStringMethod {
+    params: Vec<String>,
+    body: String,
+}
+
+fn run_scan(input: JavaInjectionSemanticInput, tool: &str) -> Result<JavaInjectionSemanticReport> {
     let source_path = resolve_source_path(&input, tool)?;
     let source = fs::read_to_string(&source_path).map_err(|error| ToolError::Execution {
         tool: tool.to_owned(),
@@ -244,6 +251,29 @@ fn analyze_java_injection_source(source: &str) -> InjectionAnalysis {
                 argument,
                 &state,
             ));
+        }
+    }
+    for (needle, sink_name) in [
+        (".execute", "execute"),
+        (".batchUpdate", "JDBCtemplate.batchUpdate"),
+        (".query", "JDBCtemplate.query"),
+        (".queryForLong", "JDBCtemplate.queryForLong"),
+        (".queryForRowSet", "JDBCtemplate.queryForRowSet"),
+        (".queryForMap", "JDBCtemplate.queryForMap"),
+        (".queryForObject", "JDBCtemplate.queryForObject"),
+        (".queryForList", "JDBCtemplate.queryForList"),
+        (".update", "JDBCtemplate.update"),
+    ] {
+        for args in method_call_args(source, needle) {
+            if let Some(argument) = args.first().filter(|argument| !argument.trim().is_empty()) {
+                sinks.push(sink_name.to_owned());
+                findings.push(classify_sink_argument(
+                    "sql_injection",
+                    sink_name,
+                    argument,
+                    &state,
+                ));
+            }
         }
     }
     for args in method_call_args(source, ".search") {
@@ -454,7 +484,17 @@ fn recommendation_for(category: &str) -> String {
 }
 
 fn infer_java_state(source: &str) -> JavaState {
-    let mut state = JavaState::default();
+    let state = JavaState {
+        methods: extract_string_methods(source),
+        ..JavaState::default()
+    };
+    infer_java_state_with_initial(source, state)
+}
+
+fn infer_java_state_with_initial(source: &str, mut state: JavaState) -> JavaState {
+    if state.methods.is_empty() {
+        state.methods = extract_string_methods(source);
+    }
     let mut pending = String::new();
     for raw_line in source.lines() {
         let Some(line) = cleaned_statement_line(raw_line) else {
@@ -472,6 +512,9 @@ fn infer_java_state(source: &str) -> JavaState {
 
         let statement = pending.trim().to_owned();
         pending.clear();
+        if apply_state_mutation(&statement, &mut state) {
+            continue;
+        }
         if let Some((name, value)) = parse_int_assignment(&statement, &state.ints) {
             state.ints.insert(name, value);
             continue;
@@ -481,7 +524,11 @@ fn infer_java_state(source: &str) -> JavaState {
         }
     }
     if !pending.trim().is_empty() {
-        if let Some((name, value)) = parse_string_assignment(pending.trim(), &state) {
+        let statement = pending.trim();
+        if apply_state_mutation(statement, &mut state) {
+            return state;
+        }
+        if let Some((name, value)) = parse_string_assignment(statement, &state) {
             state.strings.insert(name, value);
         }
     }
@@ -495,12 +542,13 @@ fn statement_is_complete(statement: &str) -> bool {
 
 fn cleaned_statement_line(raw_line: &str) -> Option<String> {
     let line = strip_line_comment(raw_line).trim().to_owned();
+    if line.starts_with("if ") || line.starts_with("if(") {
+        return inline_if_statement_tail(&line);
+    }
     if line.is_empty()
         || line.starts_with('*')
         || line.starts_with("/*")
         || line.starts_with('@')
-        || line.starts_with("if ")
-        || line.starts_with("if(")
         || line.starts_with("else")
         || line.starts_with("for ")
         || line.starts_with("while ")
@@ -511,6 +559,28 @@ fn cleaned_statement_line(raw_line: &str) -> Option<String> {
         return None;
     }
     Some(line)
+}
+
+fn inline_if_statement_tail(line: &str) -> Option<String> {
+    let open = line.find('(')?;
+    let close = matching_close_paren(line, open)?;
+    let condition = line[open + 1..close].trim();
+    let tail = line[close + 1..].trim();
+    if tail.is_empty() || tail.starts_with('{') {
+        return None;
+    }
+    if condition.contains("== null") && assigns_empty_string(tail) {
+        return None;
+    }
+    Some(tail.to_owned())
+}
+
+fn assigns_empty_string(statement: &str) -> bool {
+    let Some((_, expr)) = split_assignment(statement) else {
+        return false;
+    };
+    let expr = expr.trim_end_matches(';').trim();
+    is_quoted_string(expr) && unquote(expr).is_empty()
 }
 
 fn strip_line_comment(line: &str) -> &str {
@@ -534,6 +604,191 @@ fn strip_line_comment(line: &str) -> &str {
         }
     }
     line
+}
+
+fn apply_state_mutation(statement: &str, state: &mut JavaState) -> bool {
+    if let Some((name, source)) = parse_request_collection_source_assignment(statement) {
+        state.strings.insert(name, source);
+        return true;
+    }
+    if let Some((name, value)) = parse_string_builder_declaration(statement, state) {
+        state.builders.insert(name, value);
+        return true;
+    }
+    if let Some(name) = parse_list_declaration(statement) {
+        state.lists.entry(name).or_default();
+        return true;
+    }
+    if let Some(name) = parse_map_declaration(statement) {
+        state.maps.entry(name).or_default();
+        return true;
+    }
+    if apply_list_add(statement, state) {
+        return true;
+    }
+    if apply_list_remove(statement, state) {
+        return true;
+    }
+    if apply_map_put(statement, state) {
+        return true;
+    }
+    if apply_builder_append(statement, state) {
+        return true;
+    }
+    false
+}
+
+fn parse_request_collection_source_assignment(statement: &str) -> Option<(String, ValueState)> {
+    let (lhs, expr) = split_assignment(statement)?;
+    let name = last_identifier(lhs)?;
+    if expr.contains("request.getParameterValues(") {
+        return Some((
+            name,
+            ValueState::Tainted(http_source("request.getParameterValues", expr)),
+        ));
+    }
+    if expr.contains("request.getHeaders(") {
+        return Some((
+            name,
+            ValueState::Tainted(http_source("request.getHeaders", expr)),
+        ));
+    }
+    if expr.contains("request.getParameterNames(") {
+        return Some((
+            name,
+            ValueState::Tainted("request.getParameterNames()".to_owned()),
+        ));
+    }
+    if expr.contains("request.getHeaderNames(") {
+        return Some((
+            name,
+            ValueState::Tainted("request.getHeaderNames()".to_owned()),
+        ));
+    }
+    if expr.contains("request.getCookies(") {
+        return Some((name, ValueState::Tainted("request.getCookies()".to_owned())));
+    }
+    None
+}
+
+fn parse_string_builder_declaration(
+    statement: &str,
+    state: &JavaState,
+) -> Option<(String, ValueState)> {
+    if !statement.contains("StringBuilder") {
+        return None;
+    }
+    let (lhs, expr) = split_assignment(statement)?;
+    if !expr.contains("new StringBuilder(") && !expr.contains("new java.lang.StringBuilder(") {
+        return None;
+    }
+    let name = last_identifier(lhs)?;
+    let value = first_argument_after_open_paren(expr)
+        .map(|argument| eval_string_expr(&argument, state))
+        .unwrap_or_else(|| ValueState::Constant("empty StringBuilder".to_owned()));
+    Some((name, value))
+}
+
+fn parse_list_declaration(statement: &str) -> Option<String> {
+    if !(statement.contains("List<")
+        || statement.contains("java.util.List")
+        || statement.contains("ArrayList<")
+        || statement.contains("java.util.ArrayList"))
+    {
+        return None;
+    }
+    let (lhs, expr) = split_assignment(statement)?;
+    if !expr.contains("new ") {
+        return None;
+    }
+    last_identifier(lhs)
+}
+
+fn parse_map_declaration(statement: &str) -> Option<String> {
+    if !(statement.contains("Map<")
+        || statement.contains("java.util.Map")
+        || statement.contains("HashMap<")
+        || statement.contains("java.util.HashMap"))
+    {
+        return None;
+    }
+    let (lhs, expr) = split_assignment(statement)?;
+    if !expr.contains("new ") {
+        return None;
+    }
+    last_identifier(lhs)
+}
+
+fn apply_list_add(statement: &str, state: &mut JavaState) -> bool {
+    let Some((receiver, args)) = receiver_call_args(statement, ".add") else {
+        return false;
+    };
+    if !state.lists.contains_key(&receiver) {
+        return false;
+    }
+    let value = args
+        .first()
+        .map(|argument| eval_string_expr(argument, state))
+        .unwrap_or(ValueState::Unknown);
+    state.lists.entry(receiver).or_default().push(value);
+    true
+}
+
+fn apply_list_remove(statement: &str, state: &mut JavaState) -> bool {
+    let Some((receiver, args)) = receiver_call_args(statement, ".remove") else {
+        return false;
+    };
+    let Some(index) = args
+        .first()
+        .and_then(|argument| eval_int_expr(argument.trim(), &state.ints))
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return false;
+    };
+    let Some(values) = state.lists.get_mut(&receiver) else {
+        return false;
+    };
+    if index < values.len() {
+        values.remove(index);
+    }
+    true
+}
+
+fn apply_map_put(statement: &str, state: &mut JavaState) -> bool {
+    let Some((receiver, args)) = receiver_call_args(statement, ".put") else {
+        return false;
+    };
+    if args.len() < 2 || !state.maps.contains_key(&receiver) {
+        return false;
+    }
+    let ValueState::Constant(key) = eval_string_expr(&args[0], state) else {
+        return false;
+    };
+    let value = eval_string_expr(&args[1], state);
+    state.maps.entry(receiver).or_default().insert(key, value);
+    true
+}
+
+fn apply_builder_append(statement: &str, state: &mut JavaState) -> bool {
+    let Some((receiver, args)) = receiver_call_args(statement, ".append") else {
+        return false;
+    };
+    if !state.builders.contains_key(&receiver) || split_assignment(statement).is_some() {
+        return false;
+    }
+    let appended = args
+        .first()
+        .map(|argument| eval_string_expr(argument, state))
+        .unwrap_or(ValueState::Unknown);
+    let current = state
+        .builders
+        .get(&receiver)
+        .cloned()
+        .unwrap_or(ValueState::Unknown);
+    state
+        .builders
+        .insert(receiver, combine_concat_states(current, appended));
+    true
 }
 
 fn parse_int_assignment(line: &str, ints: &HashMap<String, i64>) -> Option<(String, i64)> {
@@ -586,17 +841,36 @@ fn split_assignment(line: &str) -> Option<(&str, &str)> {
 }
 
 fn eval_string_expr(expr: &str, state: &JavaState) -> ValueState {
+    eval_string_expr_with_depth(expr, state, 0)
+}
+
+fn eval_string_expr_with_depth(expr: &str, state: &JavaState, depth: usize) -> ValueState {
     let expr = expr.trim().trim_end_matches(';').trim();
+    if depth > 8 {
+        return ValueState::Unknown;
+    }
     if let Some((condition, true_expr, false_expr)) = split_ternary(expr) {
         return match eval_bool_expr(condition, &state.ints) {
-            Some(true) => eval_string_expr(true_expr, state),
-            Some(false) => eval_string_expr(false_expr, state),
+            Some(true) => eval_string_expr_with_depth(true_expr, state, depth + 1),
+            Some(false) => eval_string_expr_with_depth(false_expr, state, depth + 1),
             None => {
-                let true_state = eval_string_expr(true_expr, state);
-                let false_state = eval_string_expr(false_expr, state);
+                let true_state = eval_string_expr_with_depth(true_expr, state, depth + 1);
+                let false_state = eval_string_expr_with_depth(false_expr, state, depth + 1);
                 combine_branch_states(true_state, false_state)
             }
         };
+    }
+    if let Some(stripped) = expr.strip_prefix("(String)") {
+        return eval_string_expr_with_depth(stripped, state, depth + 1);
+    }
+    if let Some(value) = eval_collection_get_expr(expr, state) {
+        return value;
+    }
+    if let Some(value) = eval_string_builder_expr(expr, state) {
+        return value;
+    }
+    if let Some(value) = eval_known_string_method_call(expr, state, depth) {
+        return value;
     }
     if expr.contains("request.getHeader(") {
         return ValueState::Tainted(http_source("request.getHeader", expr));
@@ -604,25 +878,42 @@ fn eval_string_expr(expr: &str, state: &JavaState) -> ValueState {
     if expr.contains("request.getParameter(") {
         return ValueState::Tainted(http_source("request.getParameter", expr));
     }
+    if expr.contains("request.getHeaders(") {
+        return ValueState::Tainted(http_source("request.getHeaders", expr));
+    }
+    if expr.contains("request.getParameterValues(") {
+        return ValueState::Tainted(http_source("request.getParameterValues", expr));
+    }
     if expr.contains(".getTheParameter(") || expr.contains(".getTheCookie(") {
         return ValueState::Tainted(http_source("benchmark helper request source", expr));
     }
     if expr.contains(".getTheValue(") {
         return ValueState::Constant("benchmark safe helper value".to_owned());
     }
-    if expr.contains("URLDecoder.decode(") || expr.contains(".trim(") || expr.contains(".toString(") {
+    if expr.contains(".getValue()") {
+        return ValueState::Tainted("Cookie.getValue()".to_owned());
+    }
+    if expr.contains("URLDecoder.decode(") || expr.contains(".trim(") || expr.contains(".toString(")
+    {
         if let Some(inner) = first_argument_after_open_paren(expr) {
-            return eval_string_expr(&inner, state);
+            return eval_string_expr_with_depth(&inner, state, depth + 1);
         }
     }
-    if let Some(name) = expr.strip_prefix('(').and_then(|value| value.strip_suffix(')')) {
-        return eval_string_expr(name, state);
+    if let Some(name) = expr
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return eval_string_expr_with_depth(name, state, depth + 1);
     }
     if is_quoted_string(expr) {
         return ValueState::Constant(unquote(expr));
     }
     if is_java_identifier(expr) {
-        return state.strings.get(expr).cloned().unwrap_or(ValueState::Unknown);
+        return state
+            .strings
+            .get(expr)
+            .cloned()
+            .unwrap_or(ValueState::Unknown);
     }
     if let Some((name, value)) = expr_tainted_variable(expr, &state.strings) {
         return ValueState::Tainted(format!("tainted variable `{name}` ({value})"));
@@ -656,6 +947,18 @@ fn combine_branch_states(left: ValueState, right: ValueState) -> ValueState {
     }
 }
 
+fn combine_concat_states(left: ValueState, right: ValueState) -> ValueState {
+    match (left, right) {
+        (ValueState::Tainted(source), _) | (_, ValueState::Tainted(source)) => {
+            ValueState::Tainted(source)
+        }
+        (ValueState::Constant(_), ValueState::Constant(_)) => {
+            ValueState::Constant("constant expression".to_owned())
+        }
+        _ => ValueState::Unknown,
+    }
+}
+
 fn http_source(kind: &str, expr: &str) -> String {
     let name = first_string_argument(expr).unwrap_or_else(|| "unknown".to_owned());
     format!("{kind}(\"{name}\")")
@@ -663,8 +966,78 @@ fn http_source(kind: &str, expr: &str) -> String {
 
 fn first_argument_after_open_paren(expr: &str) -> Option<String> {
     let open = expr.find('(')?;
-    let args = split_arguments(&expr[open + 1..expr.rfind(')')?]);
+    let close = matching_close_paren(expr, open)?;
+    if close <= open {
+        return None;
+    }
+    let args = split_arguments(&expr[open + 1..close]);
     args.into_iter().next()
+}
+
+fn eval_collection_get_expr(expr: &str, state: &JavaState) -> Option<ValueState> {
+    let (receiver, args) = receiver_call_args(expr, ".get")?;
+    let first_arg = args.first()?;
+    if let Some(values) = state.lists.get(&receiver) {
+        let index = eval_int_expr(first_arg.trim(), &state.ints)
+            .and_then(|value| usize::try_from(value).ok())?;
+        return Some(values.get(index).cloned().unwrap_or(ValueState::Unknown));
+    }
+    if let Some(values) = state.maps.get(&receiver) {
+        let ValueState::Constant(key) = eval_string_expr(first_arg, state) else {
+            return Some(ValueState::Unknown);
+        };
+        return Some(values.get(&key).cloned().unwrap_or(ValueState::Unknown));
+    }
+    None
+}
+
+fn eval_string_builder_expr(expr: &str, state: &JavaState) -> Option<ValueState> {
+    if let Some(receiver) = expr
+        .strip_suffix(".toString()")
+        .and_then(|value| last_identifier(value))
+    {
+        if let Some(value) = state.builders.get(&receiver) {
+            return Some(value.clone());
+        }
+    }
+    let (receiver, args) = receiver_call_args(expr, ".append")?;
+    let current = state.builders.get(&receiver).cloned()?;
+    let appended = args
+        .first()
+        .map(|argument| eval_string_expr(argument, state))
+        .unwrap_or(ValueState::Unknown);
+    Some(combine_concat_states(current, appended))
+}
+
+fn eval_known_string_method_call(
+    expr: &str,
+    state: &JavaState,
+    depth: usize,
+) -> Option<ValueState> {
+    for (name, method) in &state.methods {
+        let Some(args) = method_call_args_in_expr(expr, name) else {
+            continue;
+        };
+        let mut method_state = JavaState {
+            methods: state.methods.clone(),
+            ..JavaState::default()
+        };
+        for (param, argument) in method.params.iter().zip(args.iter()) {
+            let value = eval_string_expr_with_depth(argument, state, depth + 1);
+            method_state.strings.insert(param.clone(), value);
+        }
+        let method_state = infer_java_state_with_initial(&method.body, method_state);
+        let mut return_state: Option<ValueState> = None;
+        for return_expr in return_expressions(&method.body) {
+            let value = eval_string_expr_with_depth(&return_expr, &method_state, depth + 1);
+            return_state = Some(match return_state {
+                Some(existing) => combine_branch_states(existing, value),
+                None => value,
+            });
+        }
+        return Some(return_state.unwrap_or(ValueState::Unknown));
+    }
+    None
 }
 
 fn expr_tainted_variable(
@@ -719,7 +1092,11 @@ fn identifiers_in_expr(expr: &str) -> Vec<String> {
         if ch.is_ascii_alphanumeric() || ch == '_' {
             current.push(ch);
         } else if !current.is_empty() {
-            if current.chars().next().is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic()) {
+            if current
+                .chars()
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+            {
                 identifiers.push(current.clone());
             }
             current.clear();
@@ -741,6 +1118,14 @@ fn method_call_args(source: &str, needle: &str) -> Vec<Vec<String>> {
     let mut offset = 0;
     while let Some(relative) = source[offset..].find(needle) {
         let method_end = offset + relative + needle.len();
+        if source[method_end..]
+            .chars()
+            .next()
+            .is_some_and(is_java_identifier_continue)
+        {
+            offset = method_end;
+            continue;
+        }
         let Some(open_relative) = source[method_end..].find('(') else {
             break;
         };
@@ -753,6 +1138,57 @@ fn method_call_args(source: &str, needle: &str) -> Vec<Vec<String>> {
         }
     }
     calls
+}
+
+fn method_call_args_in_expr(expr: &str, method_name: &str) -> Option<Vec<String>> {
+    for needle in [format!(".{method_name}"), method_name.to_owned()] {
+        let Some(start) = expr.find(&needle) else {
+            continue;
+        };
+        if start > 0
+            && needle == method_name
+            && expr[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_java_identifier_continue)
+        {
+            continue;
+        }
+        let method_end = start + needle.len();
+        if expr[method_end..]
+            .chars()
+            .next()
+            .is_some_and(is_java_identifier_continue)
+        {
+            continue;
+        }
+        let Some(open_relative) = expr[method_end..].find('(') else {
+            continue;
+        };
+        let open = method_end + open_relative;
+        let Some(close) = matching_close_paren(expr, open) else {
+            continue;
+        };
+        return Some(split_arguments(&expr[open + 1..close]));
+    }
+    None
+}
+
+fn receiver_call_args(statement: &str, needle: &str) -> Option<(String, Vec<String>)> {
+    let start = statement.find(needle)?;
+    let receiver = last_identifier(&statement[..start])?;
+    let method_end = start + needle.len();
+    if statement[method_end..]
+        .chars()
+        .next()
+        .is_some_and(is_java_identifier_continue)
+    {
+        return None;
+    }
+    let open_relative = statement[method_end..].find('(')?;
+    let open = method_end + open_relative;
+    let close = matching_close_paren(statement, open)?;
+    Some((receiver, split_arguments(&statement[open + 1..close])))
 }
 
 fn has_xpath_api(source: &str) -> bool {
@@ -783,6 +1219,39 @@ fn matching_close_paren(source: &str, open: usize) -> Option<usize> {
             '"' => in_string = true,
             '(' => depth += 1,
             ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn matching_close_brace(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (relative, ch) in source[open..].char_indices() {
+        let idx = open + relative;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return Some(idx);
@@ -831,6 +1300,87 @@ fn split_arguments(arguments: &str) -> Vec<String> {
     values
 }
 
+fn extract_string_methods(source: &str) -> HashMap<String, JavaStringMethod> {
+    let mut methods = HashMap::new();
+    let mut offset = 0usize;
+    while let Some(relative) = source[offset..].find("String ") {
+        let string_start = offset + relative;
+        let name_start = string_start + "String ".len();
+        let Some((name, name_end)) = parse_identifier_at(source, name_start) else {
+            offset = name_start;
+            continue;
+        };
+        let after_name = source[name_end..].trim_start();
+        if !after_name.starts_with('(') {
+            offset = name_end;
+            continue;
+        }
+        let open = source[name_end..].find('(').map(|value| name_end + value);
+        let Some(open) = open else {
+            offset = name_end;
+            continue;
+        };
+        let Some(close) = matching_close_paren(source, open) else {
+            offset = name_end;
+            continue;
+        };
+        let Some(body_open_relative) = source[close + 1..].find('{') else {
+            offset = close + 1;
+            continue;
+        };
+        let body_open = close + 1 + body_open_relative;
+        let Some(body_close) = matching_close_brace(source, body_open) else {
+            offset = body_open + 1;
+            continue;
+        };
+        let params = split_arguments(&source[open + 1..close])
+            .into_iter()
+            .filter_map(|param| last_identifier(&param))
+            .collect::<Vec<_>>();
+        methods.insert(
+            name,
+            JavaStringMethod {
+                params,
+                body: source[body_open + 1..body_close].to_owned(),
+            },
+        );
+        offset = body_close + 1;
+    }
+    methods
+}
+
+fn return_expressions(source: &str) -> Vec<String> {
+    let mut expressions = Vec::new();
+    for raw_line in source.lines() {
+        let line = strip_line_comment(raw_line).trim();
+        let Some(after_return) = line.strip_prefix("return ") else {
+            continue;
+        };
+        let expr = after_return.trim_end_matches(';').trim();
+        if !expr.is_empty() {
+            expressions.push(expr.to_owned());
+        }
+    }
+    expressions
+}
+
+fn parse_identifier_at(source: &str, start: usize) -> Option<(String, usize)> {
+    let mut chars = source[start..].char_indices();
+    let (_, first) = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut end = start + first.len_utf8();
+    for (relative, ch) in chars {
+        if is_java_identifier_continue(ch) {
+            end = start + relative + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some((source[start..end].to_owned(), end))
+}
+
 fn first_string_argument(expr: &str) -> Option<String> {
     let start = expr.find('"')? + 1;
     let mut output = String::new();
@@ -848,6 +1398,10 @@ fn first_string_argument(expr: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn last_identifier(value: &str) -> Option<String> {
+    identifiers_in_expr(value).into_iter().last()
 }
 
 fn is_quoted_string(expr: &str) -> bool {
@@ -888,8 +1442,11 @@ fn is_java_identifier(value: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    (first == '_' || first.is_ascii_alphabetic()) && chars.all(is_java_identifier_continue)
+}
+
+fn is_java_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
 }
 
 fn eval_bool_expr(expr: &str, ints: &HashMap<String, i64>) -> Option<bool> {
@@ -1093,7 +1650,10 @@ mod tests {
         let analysis = analyze_java_injection_source(source);
 
         assert_eq!(analysis.findings[0].risk_level, NORMAL);
-        assert_eq!(analysis.findings[0].category, "ldap_injection_constant_sink");
+        assert_eq!(
+            analysis.findings[0].category,
+            "ldap_injection_constant_sink"
+        );
     }
 
     #[test]
@@ -1122,7 +1682,10 @@ mod tests {
         let analysis = analyze_java_injection_source(source);
 
         assert_eq!(analysis.findings[0].risk_level, DANGER);
-        assert_eq!(analysis.findings[0].category, "xpath_injection_tainted_sink");
+        assert_eq!(
+            analysis.findings[0].category,
+            "xpath_injection_tainted_sink"
+        );
     }
 
     #[test]
@@ -1139,7 +1702,10 @@ mod tests {
         let analysis = analyze_java_injection_source(source);
 
         assert_eq!(analysis.findings[0].risk_level, DANGER);
-        assert_eq!(analysis.findings[0].category, "xpath_injection_tainted_sink");
+        assert_eq!(
+            analysis.findings[0].category,
+            "xpath_injection_tainted_sink"
+        );
     }
 
     #[test]
@@ -1154,7 +1720,10 @@ mod tests {
         let analysis = analyze_java_injection_source(source);
 
         assert_eq!(analysis.findings[0].risk_level, NORMAL);
-        assert_eq!(analysis.findings[0].category, "xpath_injection_constant_sink");
+        assert_eq!(
+            analysis.findings[0].category,
+            "xpath_injection_constant_sink"
+        );
     }
 
     #[test]
@@ -1162,6 +1731,52 @@ mod tests {
         let source = r#"
             String param = request.getParameter("vector");
             request.getSession().setAttribute(param, "10340");
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert_eq!(analysis.findings[0].risk_level, DANGER);
+        assert_eq!(analysis.findings[0].category, "trust_boundary_tainted_sink");
+    }
+
+    #[test]
+    fn preserves_taint_through_string_builder_for_session_attribute() {
+        let source = r#"
+            String param = request.getHeader("vector");
+            String bar = new Test().doSomething(param);
+            request.getSession().setAttribute(bar, "10340");
+
+            private class Test {
+                public String doSomething(String param) {
+                    StringBuilder sbxyz7858 = new StringBuilder(param);
+                    String bar = sbxyz7858.append("_SafeStuff").toString();
+                    return bar;
+                }
+            }
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert_eq!(analysis.findings[0].risk_level, DANGER);
+        assert_eq!(analysis.findings[0].category, "trust_boundary_tainted_sink");
+    }
+
+    #[test]
+    fn preserves_cookie_value_through_inline_if_split_for_session_attribute() {
+        let source = r#"
+            javax.servlet.http.Cookie[] theCookies = request.getCookies();
+            String param = "";
+            param = java.net.URLDecoder.decode(theCookie.getValue(), "UTF-8");
+            String bar = new Test().doSomething(param);
+            request.getSession().setAttribute(bar, "10340");
+
+            private class Test {
+                public String doSomething(String param) {
+                    String bar = "";
+                    if (param != null) bar = param.split(" ")[0];
+                    return bar;
+                }
+            }
         "#;
 
         let analysis = analyze_java_injection_source(source);
@@ -1183,7 +1798,100 @@ mod tests {
         let analysis = analyze_java_injection_source(source);
 
         assert_eq!(analysis.findings[0].risk_level, NORMAL);
-        assert_eq!(analysis.findings[0].category, "trust_boundary_constant_sink");
+        assert_eq!(
+            analysis.findings[0].category,
+            "trust_boundary_constant_sink"
+        );
+    }
+
+    #[test]
+    fn classifies_spring_jdbc_template_execute_as_sql_sink() {
+        let source = r#"
+            String param = request.getHeader("vector");
+            int num = 106;
+            String bar;
+            bar = (7*42) - num > 200 ? "This should never happen" : param;
+            String sql = "SELECT * from USERS where PASSWORD='" + bar + "'";
+            org.owasp.benchmark.helpers.DatabaseHelper.JDBCtemplate.execute(sql);
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert_eq!(analysis.findings[0].risk_level, DANGER);
+        assert_eq!(analysis.findings[0].sink, "execute");
+    }
+
+    #[test]
+    fn classifies_parameter_values_prepare_call_as_danger() {
+        let source = r#"
+            String[] values = request.getParameterValues("vector");
+            String param;
+            param = values[0];
+            String bar;
+            bar = param;
+            String sql = "{call " + bar + "}";
+            connection.prepareCall(sql, java.sql.ResultSet.TYPE_FORWARD_ONLY);
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert_eq!(analysis.findings[0].risk_level, DANGER);
+        assert_eq!(analysis.findings[0].category, "sql_injection_tainted_sink");
+    }
+
+    #[test]
+    fn classifies_headers_inner_map_flow_as_danger() {
+        let source = r#"
+            String param = "";
+            java.util.Enumeration<String> headers = request.getHeaders("vector");
+            param = headers.nextElement();
+            String bar = new Test().doSomething(param);
+            String sql = "SELECT * from USERS where PASSWORD='" + bar + "'";
+            connection.prepareStatement(sql, java.sql.ResultSet.TYPE_FORWARD_ONLY);
+
+            private class Test {
+                public String doSomething(String param) {
+                    String bar = "safe!";
+                    java.util.HashMap<String,Object> map84096 = new java.util.HashMap<String,Object>();
+                    map84096.put("keyA-84096", "a Value");
+                    map84096.put("keyB-84096", param);
+                    bar = (String)map84096.get("keyB-84096");
+                    return bar;
+                }
+            }
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert_eq!(analysis.findings[0].risk_level, DANGER);
+        assert_eq!(analysis.findings[0].category, "sql_injection_tainted_sink");
+    }
+
+    #[test]
+    fn classifies_safe_inner_method_statement_execute_as_normal() {
+        let source = r#"
+            String param = request.getHeader("vector");
+            int num = 86;
+            String bar = new Test().doSomething(param);
+            String sql = "SELECT * from USERS where PASSWORD='" + bar + "'";
+            statement.execute(sql, new String[] { "username", "password" });
+
+            private class Test {
+                public String doSomething(String param) {
+                    String bar;
+                    int num = 86;
+                    if ( (7*42) - num > 200 )
+                       bar = "This_should_always_happen";
+                    else bar = param;
+                    return bar;
+                }
+            }
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert_eq!(analysis.findings[0].risk_level, NORMAL);
+        assert_eq!(analysis.findings[0].category, "sql_injection_constant_sink");
     }
 
     #[test]

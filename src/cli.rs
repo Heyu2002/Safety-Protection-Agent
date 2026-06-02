@@ -35,6 +35,10 @@ use serde_json::Value;
 use serde_json::json;
 
 const COMPACT_MAX_TOKENS: u32 = 1200;
+const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
+const DEFAULT_AUTO_COMPACT_PERCENT: usize = 90;
+const MESSAGE_OVERHEAD_TOKENS: usize = 4;
+const TOOL_OVERHEAD_TOKENS: usize = 8;
 const USER_PROMPT: &str = "user> ";
 const AGENT_PREFIX: &str = "agent> ";
 const USER_PROMPT_COLOR: Color = Color::Rgb {
@@ -171,6 +175,58 @@ impl AgentRuntimeOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoCompactOptions {
+    enabled: bool,
+    context_window_tokens: usize,
+    token_limit: usize,
+}
+
+impl AutoCompactOptions {
+    fn from_env() -> anyhow::Result<Self> {
+        let enabled = env_flag_enabled("LLM_AUTO_COMPACT")
+            .or_else(|| env_flag_enabled("SPA_AUTO_COMPACT"))
+            .unwrap_or(true);
+        let context_window_tokens =
+            optional_env_usize_any(&["LLM_CONTEXT_WINDOW", "SPA_CONTEXT_WINDOW"])?
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+        if context_window_tokens == 0 {
+            anyhow::bail!("LLM_CONTEXT_WINDOW must be greater than zero");
+        }
+
+        let percent =
+            optional_env_usize_any(&["LLM_AUTO_COMPACT_PERCENT", "SPA_AUTO_COMPACT_PERCENT"])?
+                .unwrap_or(DEFAULT_AUTO_COMPACT_PERCENT);
+        if percent == 0 {
+            anyhow::bail!("LLM_AUTO_COMPACT_PERCENT must be greater than zero");
+        }
+
+        let hard_limit = context_window_tokens
+            .saturating_mul(DEFAULT_AUTO_COMPACT_PERCENT)
+            .saturating_div(100)
+            .max(1);
+        let derived_limit = context_window_tokens
+            .saturating_mul(percent)
+            .saturating_div(100)
+            .max(1);
+        let configured_limit = optional_env_usize_any(&[
+            "LLM_AUTO_COMPACT_TOKEN_LIMIT",
+            "SPA_AUTO_COMPACT_TOKEN_LIMIT",
+        ])?
+        .unwrap_or(derived_limit);
+
+        Ok(Self {
+            enabled,
+            context_window_tokens,
+            token_limit: configured_limit.min(hard_limit),
+        })
+    }
+
+    fn should_compact(self, estimated_tokens: usize) -> bool {
+        self.enabled && estimated_tokens >= self.token_limit
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum CliCommand {
     Mcp {
@@ -212,6 +268,7 @@ pub async fn run_chat_cli(default_repl: bool) -> anyhow::Result<()> {
     }
     let client = client_from_config(config)?;
     let runtime_options = AgentRuntimeOptions::from_cli(&args)?;
+    let auto_compact = AutoCompactOptions::from_env()?;
     let repl = args.repl || (default_repl && args.prompt.is_none());
     let system = default_system_prompt().to_owned();
 
@@ -223,6 +280,7 @@ pub async fn run_chat_cli(default_repl: bool) -> anyhow::Result<()> {
             args.temperature,
             args.max_tokens,
             runtime_options,
+            auto_compact,
         )
         .await?;
     } else {
@@ -236,6 +294,7 @@ pub async fn run_chat_cli(default_repl: bool) -> anyhow::Result<()> {
             args.temperature,
             args.max_tokens,
             runtime_options,
+            auto_compact,
         )
         .await?;
     }
@@ -314,16 +373,19 @@ async fn run_once(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     runtime_options: AgentRuntimeOptions,
+    auto_compact: AutoCompactOptions,
 ) -> anyhow::Result<()> {
     let mut messages = Vec::new();
-    messages.push(ChatMessage::system(system));
+    messages.push(ChatMessage::system(&system));
     submit_repl_turn(
         client,
         &mut messages,
+        &system,
         prompt,
         temperature,
         max_tokens,
         runtime_options,
+        auto_compact,
     )
     .await?;
     Ok(())
@@ -336,6 +398,7 @@ async fn run_repl(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     runtime_options: AgentRuntimeOptions,
+    auto_compact: AutoCompactOptions,
 ) -> anyhow::Result<()> {
     let mut history = Vec::new();
     history.push(ChatMessage::system(&system));
@@ -350,10 +413,12 @@ async fn run_repl(
         submit_repl_turn(
             client,
             &mut history,
+            &system,
             prompt,
             temperature,
             max_tokens,
             runtime_options,
+            auto_compact,
         )
         .await?;
     }
@@ -400,10 +465,12 @@ async fn run_repl(
                 submit_repl_turn(
                     client,
                     &mut history,
+                    &system,
                     input.to_owned(),
                     temperature,
                     max_tokens,
                     runtime_options,
+                    auto_compact,
                 )
                 .await?;
             }
@@ -872,21 +939,172 @@ fn format_compact_prompt(messages: &[ChatMessage]) -> String {
     prompt
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn maybe_auto_compact_before_agent_turn(
+    client: &dyn LlmClient,
+    history: &mut Vec<ChatMessage>,
+    system: &str,
+    prompt: &str,
+    tools: &[ToolSpec],
+    remote_mcp: &RemoteMcpToolbox,
+    active_skill_context: &str,
+    runtime_options: AgentRuntimeOptions,
+    auto_compact: AutoCompactOptions,
+    use_native_tools: bool,
+) -> anyhow::Result<bool> {
+    if !auto_compact.enabled {
+        return Ok(false);
+    }
+
+    let messages = if use_native_tools {
+        build_native_agent_messages(
+            history,
+            prompt,
+            tools,
+            remote_mcp,
+            active_skill_context,
+            runtime_options,
+        )
+    } else {
+        build_agent_messages(
+            history,
+            prompt,
+            tools,
+            remote_mcp,
+            active_skill_context,
+            runtime_options,
+        )
+    };
+    let mut estimated_tokens = estimate_messages_tokens(&messages);
+    if use_native_tools {
+        estimated_tokens =
+            estimated_tokens.saturating_add(estimate_tool_specs_tokens_for_native(tools));
+    }
+
+    if !auto_compact.should_compact(estimated_tokens) {
+        return Ok(false);
+    }
+
+    println!(
+        "Auto-compacting context: estimated {estimated_tokens}/{} tokens before this turn.",
+        auto_compact.token_limit
+    );
+    compact_history(client, history, system).await
+}
+
+async fn maybe_auto_compact_after_turn(
+    client: &dyn LlmClient,
+    history: &mut Vec<ChatMessage>,
+    system: &str,
+    last_context_tokens: usize,
+    auto_compact: AutoCompactOptions,
+) -> anyhow::Result<bool> {
+    if !auto_compact.enabled {
+        return Ok(false);
+    }
+
+    let durable_history_tokens = estimate_messages_tokens(history);
+    let estimated_tokens = durable_history_tokens.max(last_context_tokens);
+    if !auto_compact.should_compact(estimated_tokens) {
+        return Ok(false);
+    }
+
+    println!(
+        "Auto-compacting context: estimated {estimated_tokens}/{} tokens after this turn.",
+        auto_compact.token_limit
+    );
+    compact_history(client, history, system).await
+}
+
+fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(estimate_message_tokens)
+        .fold(0usize, usize::saturating_add)
+}
+
+fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    MESSAGE_OVERHEAD_TOKENS
+        .saturating_add(estimate_text_tokens(role_label(&message.role)))
+        .saturating_add(estimate_text_tokens(&message.content))
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    text.len().div_ceil(4).max(1)
+}
+
+fn estimate_tool_specs_tokens_for_native(tools: &[ToolSpec]) -> usize {
+    tools
+        .iter()
+        .map(|tool| {
+            TOOL_OVERHEAD_TOKENS
+                .saturating_add(estimate_text_tokens(&tool.name))
+                .saturating_add(estimate_text_tokens(&tool.description))
+                .saturating_add(estimate_text_tokens(&tool.input_schema.to_string()))
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+fn estimate_agent_tool_specs_tokens(tools: &[AgentToolSpec]) -> usize {
+    tools
+        .iter()
+        .map(|tool| {
+            TOOL_OVERHEAD_TOKENS
+                .saturating_add(estimate_text_tokens(&tool.name))
+                .saturating_add(estimate_text_tokens(&tool.description))
+                .saturating_add(estimate_text_tokens(&tool.input_schema.to_string()))
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+fn estimate_agent_transcript_tokens(items: &[AgentToolTranscriptItem]) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            AgentToolTranscriptItem::ToolCall {
+                call_id,
+                name,
+                input,
+            } => TOOL_OVERHEAD_TOKENS
+                .saturating_add(estimate_text_tokens(call_id))
+                .saturating_add(estimate_text_tokens(name))
+                .saturating_add(estimate_text_tokens(&input.to_string())),
+            AgentToolTranscriptItem::ToolResult { call_id, output } => TOOL_OVERHEAD_TOKENS
+                .saturating_add(estimate_text_tokens(call_id))
+                .saturating_add(estimate_text_tokens(output)),
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+fn estimate_agent_turn_request_tokens(request: &AgentTurnRequest) -> usize {
+    estimate_messages_tokens(&request.messages)
+        .saturating_add(estimate_agent_tool_specs_tokens(&request.tools))
+        .saturating_add(estimate_agent_transcript_tokens(&request.input_items))
+}
+
 async fn submit_repl_turn(
     client: &dyn LlmClient,
     history: &mut Vec<ChatMessage>,
+    system: &str,
     prompt: String,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     runtime_options: AgentRuntimeOptions,
+    auto_compact: AutoCompactOptions,
 ) -> anyhow::Result<()> {
     let response = run_agent_loop(
         client,
         history,
+        system,
         &prompt,
         temperature,
         max_tokens,
         runtime_options,
+        auto_compact,
     )
     .await?;
     if !response.already_displayed {
@@ -894,6 +1112,14 @@ async fn submit_repl_turn(
     }
     history.push(ChatMessage::user(prompt));
     history.push(ChatMessage::assistant(response.message));
+    maybe_auto_compact_after_turn(
+        client,
+        history,
+        system,
+        response.estimated_context_tokens,
+        auto_compact,
+    )
+    .await?;
     Ok(())
 }
 
@@ -901,15 +1127,18 @@ async fn submit_repl_turn(
 struct AgentLoopResponse {
     message: String,
     already_displayed: bool,
+    estimated_context_tokens: usize,
 }
 
 async fn run_agent_loop(
     client: &dyn LlmClient,
-    history: &[ChatMessage],
+    history: &mut Vec<ChatMessage>,
+    system: &str,
     prompt: &str,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     runtime_options: AgentRuntimeOptions,
+    auto_compact: AutoCompactOptions,
 ) -> anyhow::Result<AgentLoopResponse> {
     let registry = ToolRegistry::with_builtin_options(BuiltinToolOptions {
         include_markdown_report: runtime_options.markdown_report_enabled,
@@ -922,11 +1151,30 @@ async fn run_agent_loop(
         remote_mcp.record_connection_error(error);
     }
     let tools = combined_tool_specs(&registry, remote_mcp.status());
-    let active_skill_context = load_active_skill_context(client, history, prompt)
+    let mut active_skill_context = load_active_skill_context(client, history, prompt)
         .await
         .unwrap_or_default();
+    let use_native_tools = client.supports_native_tools() && native_tools_enabled_from_env();
+    if maybe_auto_compact_before_agent_turn(
+        client,
+        history,
+        system,
+        prompt,
+        &tools,
+        remote_mcp.status(),
+        &active_skill_context,
+        runtime_options,
+        auto_compact,
+        use_native_tools,
+    )
+    .await?
+    {
+        active_skill_context = load_active_skill_context(client, history, prompt)
+            .await
+            .unwrap_or_default();
+    }
 
-    let response = if client.supports_native_tools() && native_tools_enabled_from_env() {
+    let response = if use_native_tools {
         run_native_agent_loop(
             client,
             history,
@@ -971,6 +1219,27 @@ fn env_flag_enabled(name: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn optional_env_usize_any(names: &[&'static str]) -> anyhow::Result<Option<usize>> {
+    for name in names {
+        let Ok(raw) = std::env::var(name) else {
+            continue;
+        };
+        let value = raw.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?;
+        if parsed == 0 {
+            anyhow::bail!("{name} must be a positive integer");
+        }
+        return Ok(Some(parsed));
+    }
+
+    Ok(None)
 }
 
 fn combined_tool_specs(registry: &ToolRegistry, remote_mcp: &RemoteMcpToolbox) -> Vec<ToolSpec> {
@@ -1263,6 +1532,8 @@ async fn run_fallback_agent_loop(
             max_tokens,
         )
         .await?;
+        let response_context_tokens = estimate_messages_tokens(&loop_messages)
+            .saturating_add(estimate_message_tokens(&ChatMessage::assistant(&raw)));
         let Some(decision) = parse_agent_decision(&raw) else {
             loop_messages.push(ChatMessage::assistant(raw.clone()));
             loop_messages.push(ChatMessage::user(format_missing_decision_prompt(&raw)));
@@ -1274,12 +1545,14 @@ async fn run_fallback_agent_loop(
                 return Ok(AgentLoopResponse {
                     message,
                     already_displayed: false,
+                    estimated_context_tokens: response_context_tokens,
                 });
             }
             AgentDecision::Final { message } => {
                 return Ok(AgentLoopResponse {
                     message,
                     already_displayed: false,
+                    estimated_context_tokens: response_context_tokens,
                 });
             }
             AgentDecision::CallTool { tool_name, input } => {
@@ -1362,6 +1635,7 @@ async fn run_native_agent_loop(
         if let Some(max_tokens) = max_tokens {
             request = request.with_max_tokens(max_tokens);
         }
+        let request_context_tokens = estimate_agent_turn_request_tokens(&request);
 
         let displayed_before = renderer.delta_count();
         let spinner = SpinnerHandle::start("thinking");
@@ -1377,6 +1651,8 @@ async fn run_native_agent_loop(
         renderer.clear_spinner();
         renderer.finish_message();
         let final_turn_displayed = renderer.delta_count() > displayed_before;
+        let response_context_tokens =
+            request_context_tokens.saturating_add(estimate_text_tokens(&turn.content));
 
         if !turn.content.trim().is_empty() {
             final_content = turn.content.clone();
@@ -1387,6 +1663,7 @@ async fn run_native_agent_loop(
             return Ok(AgentLoopResponse {
                 message: final_content,
                 already_displayed: final_turn_displayed,
+                estimated_context_tokens: response_context_tokens,
             });
         }
 
@@ -1974,6 +2251,7 @@ Rules:
 - Call tools only for authorized/local/defensive testing requests.
 - When a concrete authorized/local/lab/benchmark target is available, prefer a bounded low-impact attempt over asking for more details. Do not stop at skepticism if a safe probe, browser inspection, or generic HTTP active probe can reduce uncertainty.
 - In authorized local, lab, benchmark, CTF, staging, or owned targets, use a red-team validation posture: actively probe bounded inputs before judging, and do not equate unknown input shape with safety.
+- For benchmark, lab, or security evaluation, assume a plausible vulnerability hypothesis first. Do not return not_vulnerable merely because no obvious issue is visible. Attempt bounded, low-impact validation. Only classify as not_vulnerable or low risk after baseline comparison and representative coverage. If validation cannot be completed, return inconclusive instead of safe.
 - Favor recall in authorized labs. A reachable dangerous sink plus weakness-specific observable behavior is actionable evidence; full data extraction, shell access, or destructive proof is not required.
 - Use not_vulnerable only after a usable baseline and representative low-impact probes cover likely query, body, path, header, cookie, and visible API inputs. If the real input shape is still unknown, use inconclusive or suspected rather than not_vulnerable.
 - For bare benchmark/lab case URLs, try a bounded parameter set before asking for more data or returning a negative verdict: case ID, visible fields, `vector`, `id`, `q`, `query`, `search`, `name`, `value`, `input`, `file`, `filename`, `path`, `url`, `next`, `cmd`, `command`, `exec`, `token`, common headers such as `referer`, `user-agent`, `x-forwarded-for`, likely `vector` headers/cookies, and visible route/path tokens.
@@ -2046,6 +2324,7 @@ Rules:
 - Call tools only for authorized/local/defensive testing requests.
 - When a concrete authorized/local/lab/benchmark target is available, prefer a bounded low-impact attempt over asking for more details. Do not stop at skepticism if a safe probe, browser inspection, or generic HTTP active probe can reduce uncertainty.
 - In authorized local, lab, benchmark, CTF, staging, or owned targets, use a red-team validation posture: actively probe bounded inputs before judging, and do not equate unknown input shape with safety.
+- For benchmark, lab, or security evaluation, assume a plausible vulnerability hypothesis first. Do not return not_vulnerable merely because no obvious issue is visible. Attempt bounded, low-impact validation. Only classify as not_vulnerable or low risk after baseline comparison and representative coverage. If validation cannot be completed, return inconclusive instead of safe.
 - Favor recall in authorized labs. A reachable dangerous sink plus weakness-specific observable behavior is actionable evidence; full data extraction, shell access, or destructive proof is not required.
 - Use not_vulnerable only after a usable baseline and representative low-impact probes cover likely query, body, path, header, cookie, and visible API inputs. If the real input shape is still unknown, use inconclusive or suspected rather than not_vulnerable.
 - For bare benchmark/lab case URLs, try a bounded parameter set before asking for more data or returning a negative verdict: case ID, visible fields, `vector`, `id`, `q`, `query`, `search`, `name`, `value`, `input`, `file`, `filename`, `path`, `url`, `next`, `cmd`, `command`, `exec`, `token`, common headers such as `referer`, `user-agent`, `x-forwarded-for`, likely `vector` headers/cookies, and visible route/path tokens.
@@ -2317,6 +2596,23 @@ mod tests {
         }
     }
 
+    unsafe fn clear_auto_compact_env() {
+        for name in [
+            "LLM_AUTO_COMPACT",
+            "SPA_AUTO_COMPACT",
+            "LLM_CONTEXT_WINDOW",
+            "SPA_CONTEXT_WINDOW",
+            "LLM_AUTO_COMPACT_PERCENT",
+            "SPA_AUTO_COMPACT_PERCENT",
+            "LLM_AUTO_COMPACT_TOKEN_LIMIT",
+            "SPA_AUTO_COMPACT_TOKEN_LIMIT",
+        ] {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
     struct FakeClient {
         request: Mutex<Option<CompletionRequest>>,
         response_content: String,
@@ -2409,6 +2705,87 @@ mod tests {
                 .expect("fake client mutex poisoned")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn auto_compact_options_clamp_limit_to_ninety_percent() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        unsafe {
+            clear_auto_compact_env();
+            std::env::set_var("LLM_CONTEXT_WINDOW", "1000");
+            std::env::set_var("LLM_AUTO_COMPACT_TOKEN_LIMIT", "950");
+        }
+
+        let options = AutoCompactOptions::from_env().expect("options should parse");
+
+        assert!(options.enabled);
+        assert_eq!(options.context_window_tokens, 1000);
+        assert_eq!(options.token_limit, 900);
+
+        unsafe {
+            clear_auto_compact_env();
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_compact_before_turn_replaces_history_when_estimate_exceeds_limit() {
+        let client = FakeClient::default();
+        let system = "You are a security assistant.".to_string();
+        let mut history = vec![
+            ChatMessage::system(&system),
+            ChatMessage::user("A".repeat(200)),
+            ChatMessage::assistant("B".repeat(200)),
+        ];
+        let options = AutoCompactOptions {
+            enabled: true,
+            context_window_tokens: 100,
+            token_limit: 40,
+        };
+
+        let compacted = maybe_auto_compact_before_agent_turn(
+            &client,
+            &mut history,
+            &system,
+            "continue",
+            &[],
+            &RemoteMcpToolbox::empty(),
+            "",
+            test_runtime_options(),
+            options,
+            false,
+        )
+        .await
+        .expect("auto compact should succeed");
+
+        assert!(compacted);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, system);
+        assert!(history[1].content.contains(COMPACTED_CONTEXT_PREFIX));
+        assert!(history[1].content.contains("compact command"));
+    }
+
+    #[tokio::test]
+    async fn auto_compact_after_turn_uses_last_context_estimate() {
+        let client = FakeClient::default();
+        let system = "You are a security assistant.".to_string();
+        let mut history = vec![
+            ChatMessage::system(&system),
+            ChatMessage::user("short"),
+            ChatMessage::assistant("short"),
+        ];
+        let options = AutoCompactOptions {
+            enabled: true,
+            context_window_tokens: 100,
+            token_limit: 40,
+        };
+
+        let compacted = maybe_auto_compact_after_turn(&client, &mut history, &system, 50, options)
+            .await
+            .expect("auto compact should succeed");
+
+        assert!(compacted);
+        assert_eq!(history.len(), 2);
+        assert!(history[1].content.contains(COMPACTED_CONTEXT_PREFIX));
     }
 
     #[test]

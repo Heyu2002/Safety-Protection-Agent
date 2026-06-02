@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -116,7 +116,7 @@ fn run_scan(input: JavaCryptoSemanticInput, tool: &str) -> Result<JavaCryptoSema
         .into_iter()
         .collect::<Vec<_>>();
     let summary = if findings.is_empty() {
-        "Java crypto semantic scan completed: no MessageDigest/Cipher getInstance calls found."
+        "Java crypto semantic scan completed: no MessageDigest/Cipher/KeyGenerator getInstance calls found."
             .to_owned()
     } else {
         let dangerous = findings
@@ -180,22 +180,30 @@ fn resolve_source_path(input: &JavaCryptoSemanticInput, tool: &str) -> Result<Pa
 
 fn analyze_java_crypto_source(source: &str) -> Vec<CryptoSemanticFinding> {
     let mut findings = Vec::new();
-    for algorithm in get_instance_algorithms(source, "MessageDigest.getInstance") {
+    let string_values = infer_string_values(source);
+    for algorithm in get_instance_algorithms(source, "MessageDigest.getInstance", &string_values) {
         findings.push(classify_hash_algorithm(&algorithm));
     }
-    for transformation in get_instance_algorithms(source, "Cipher.getInstance") {
+    for transformation in get_instance_algorithms(source, "Cipher.getInstance", &string_values) {
         findings.push(classify_cipher_transformation(&transformation));
+    }
+    for algorithm in get_instance_algorithms(source, "KeyGenerator.getInstance", &string_values) {
+        findings.push(classify_key_generator_algorithm(&algorithm));
     }
     findings
 }
 
-fn get_instance_algorithms(source: &str, target: &str) -> Vec<String> {
+fn get_instance_algorithms(
+    source: &str,
+    target: &str,
+    string_values: &HashMap<String, String>,
+) -> Vec<String> {
     let mut values = Vec::new();
     let mut offset = 0;
     while let Some(relative) = source[offset..].find(target) {
         let target_start = offset + relative;
         let after_target = target_start + target.len();
-        if let Some(value) = first_string_argument(&source[after_target..]) {
+        if let Some(value) = first_algorithm_argument(&source[after_target..], string_values) {
             push_unique(&mut values, value);
         }
         offset = after_target;
@@ -203,35 +211,14 @@ fn get_instance_algorithms(source: &str, target: &str) -> Vec<String> {
     values
 }
 
-fn first_string_argument(after_target: &str) -> Option<String> {
+fn first_algorithm_argument(
+    after_target: &str,
+    string_values: &HashMap<String, String>,
+) -> Option<String> {
     let open = after_target.find('(')?;
-    let mut chars = after_target[open + 1..].char_indices().peekable();
-    while let Some((_, ch)) = chars.peek().copied() {
-        if ch.is_whitespace() {
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    if chars.next()?.1 != '"' {
-        return None;
-    }
-
-    let mut output = String::new();
-    let mut escaped = false;
-    for (_, ch) in chars {
-        if escaped {
-            output.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            return Some(output);
-        } else {
-            output.push(ch);
-        }
-    }
-    None
+    let close = matching_close_paren(after_target, open)?;
+    let args = split_arguments(&after_target[open + 1..close]);
+    resolve_string_expr(args.first()?, string_values)
 }
 
 fn classify_hash_algorithm(algorithm: &str) -> CryptoSemanticFinding {
@@ -335,6 +322,280 @@ fn weak_cipher_finding(transformation: &str, evidence: String) -> CryptoSemantic
     }
 }
 
+fn classify_key_generator_algorithm(algorithm: &str) -> CryptoSemanticFinding {
+    let normalized = normalize_algorithm(algorithm);
+    if matches!(
+        normalized.as_str(),
+        "DES" | "DESEDE" | "TRIPLEDES" | "RC2" | "RC4" | "ARCFOUR"
+    ) {
+        return CryptoSemanticFinding {
+            category: "weak_key_generator_algorithm".to_owned(),
+            algorithm: algorithm.to_owned(),
+            risk_level: DANGER.to_owned(),
+            evidence: format!("KeyGenerator.getInstance uses weak key algorithm `{algorithm}`."),
+            recommendation:
+                "Generate keys for AES-GCM or another modern authenticated encryption primitive."
+                    .to_owned(),
+        };
+    }
+
+    if normalized == "AES" {
+        return CryptoSemanticFinding {
+            category: "acceptable_key_generator_algorithm".to_owned(),
+            algorithm: algorithm.to_owned(),
+            risk_level: NORMAL.to_owned(),
+            evidence: format!("KeyGenerator.getInstance uses acceptable key algorithm `{algorithm}`."),
+            recommendation:
+                "Keep using strong key algorithms and pair them with authenticated encryption modes."
+                    .to_owned(),
+        };
+    }
+
+    CryptoSemanticFinding {
+        category: "unknown_key_generator_algorithm".to_owned(),
+        algorithm: algorithm.to_owned(),
+        risk_level: WARNING.to_owned(),
+        evidence: format!(
+            "KeyGenerator.getInstance uses unclassified key algorithm `{algorithm}`."
+        ),
+        recommendation: "Manually verify generated key strength and algorithm suitability."
+            .to_owned(),
+    }
+}
+
+fn infer_string_values(source: &str) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    for raw_line in source.lines() {
+        let line = strip_line_comment(raw_line).trim();
+        let Some((lhs, expr)) = split_assignment(line) else {
+            continue;
+        };
+        let Some(name) = last_identifier(lhs) else {
+            continue;
+        };
+        if let Some(value) = resolve_string_expr(expr.trim_end_matches(';').trim(), &values) {
+            values.insert(name, value);
+        }
+    }
+    values
+}
+
+fn resolve_string_expr(expr: &str, string_values: &HashMap<String, String>) -> Option<String> {
+    let expr = expr.trim().trim_end_matches(';').trim();
+    if let Some(value) = expr.strip_prefix("(String)") {
+        return resolve_string_expr(value, string_values);
+    }
+    if is_quoted_string(expr) {
+        return Some(unquote(expr));
+    }
+    if expr.contains(".getProperty(") {
+        let open = expr.find('(')?;
+        let close = matching_close_paren(expr, open)?;
+        let args = split_arguments(&expr[open + 1..close]);
+        if let Some(default_value) = args.get(1) {
+            return resolve_string_expr(default_value, string_values);
+        }
+    }
+    if is_java_identifier(expr) {
+        return string_values.get(expr).cloned();
+    }
+    None
+}
+
+fn split_assignment(line: &str) -> Option<(&str, &str)> {
+    for (idx, ch) in line.char_indices() {
+        if ch != '=' {
+            continue;
+        }
+        let previous = line[..idx].chars().next_back();
+        let next = line[idx + 1..].chars().next();
+        if matches!(previous, Some('=' | '!' | '<' | '>')) || next == Some('=') {
+            continue;
+        }
+        return Some((line[..idx].trim(), line[idx + 1..].trim()));
+    }
+    None
+}
+
+fn split_arguments(arguments: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in arguments.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                values.push(arguments[start..idx].trim().to_owned());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = arguments[start..].trim();
+    if !tail.is_empty() {
+        values.push(tail.to_owned());
+    }
+    values
+}
+
+fn matching_close_paren(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (relative, ch) in source[open..].char_indices() {
+        let idx = open + relative;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn strip_line_comment(line: &str) -> &str {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string && line[idx..].starts_with("//") {
+            return &line[..idx];
+        }
+    }
+    line
+}
+
+fn is_quoted_string(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    if !trimmed.starts_with('"') {
+        return false;
+    }
+    let mut escaped = false;
+    for (idx, ch) in trimmed[1..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return trimmed[idx + 2..].trim().is_empty();
+        }
+    }
+    false
+}
+
+fn unquote(expr: &str) -> String {
+    let trimmed = expr.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .to_owned()
+}
+
+fn last_identifier(value: &str) -> Option<String> {
+    identifiers_in_expr(value).into_iter().last()
+}
+
+fn identifiers_in_expr(expr: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in expr.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            continue;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if current
+                .chars()
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+            {
+                identifiers.push(current.clone());
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty()
+        && current
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+    {
+        identifiers.push(current);
+    }
+    identifiers
+}
+
+fn is_java_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn normalize_algorithm(algorithm: &str) -> String {
     algorithm
         .chars()
@@ -396,15 +657,39 @@ mod tests {
             java.security.MessageDigest.getInstance("sha-384", provider[0]);
             javax.crypto.Cipher.getInstance("AES/CBC/PKCS5PADDING", provider);
         "#;
+        let values = infer_string_values(source);
 
         assert_eq!(
-            get_instance_algorithms(source, "MessageDigest.getInstance"),
+            get_instance_algorithms(source, "MessageDigest.getInstance", &values),
             vec!["sha-384".to_owned()]
         );
         assert_eq!(
-            get_instance_algorithms(source, "Cipher.getInstance"),
+            get_instance_algorithms(source, "Cipher.getInstance", &values),
             vec!["AES/CBC/PKCS5PADDING".to_owned()]
         );
+    }
+
+    #[test]
+    fn resolves_cipher_algorithm_variable_from_property_default() {
+        let source = r#"
+            String algorithm = benchmarkprops.getProperty("cryptoAlg1", "DESede/ECB/PKCS5Padding");
+            javax.crypto.Cipher c = javax.crypto.Cipher.getInstance(algorithm);
+        "#;
+        let findings = analyze_java_crypto_source(source);
+
+        assert_eq!(findings[0].risk_level, DANGER);
+        assert_eq!(findings[0].category, "weak_cipher_transformation");
+        assert_eq!(findings[0].algorithm, "DESede/ECB/PKCS5Padding");
+    }
+
+    #[test]
+    fn classifies_des_key_generator_as_weak() {
+        let findings = analyze_java_crypto_source(
+            r#"javax.crypto.SecretKey key = javax.crypto.KeyGenerator.getInstance("DES").generateKey();"#,
+        );
+
+        assert_eq!(findings[0].risk_level, DANGER);
+        assert_eq!(findings[0].category, "weak_key_generator_algorithm");
     }
 
     #[test]

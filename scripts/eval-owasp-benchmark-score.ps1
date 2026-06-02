@@ -15,6 +15,7 @@ param(
     [int]$MaxTokens = 0,
     [ValidateSet("auto", "on", "off")]
     [string]$ReportOutput = "off",
+    [int]$Jobs = 1,
     [switch]$RandomSample,
     [int]$Seed = 0,
     [switch]$SkipHealthCheck,
@@ -467,11 +468,275 @@ function New-ToolCoveragePlan {
     return ($lines -join [Environment]::NewLine)
 }
 
+function New-ScoreSummary([string]$RunnerName, [object[]]$Results) {
+    $total = $Results.Count
+    $tp = @($Results | Where-Object { $_.outcome -eq "TP" }).Count
+    $fp = @($Results | Where-Object { $_.outcome -eq "FP" }).Count
+    $tn = @($Results | Where-Object { $_.outcome -eq "TN" }).Count
+    $fn = @($Results | Where-Object { $_.outcome -eq "FN" }).Count
+    $inconclusive = @($Results | Where-Object { $_.outcome -eq "inconclusive" }).Count
+    $parseErrors = @($Results | Where-Object { $_.outcome -eq "parse_error" }).Count
+    $executionErrors = @($Results | Where-Object { $_.outcome -eq "execution_error" }).Count
+    $decided = $tp + $fp + $tn + $fn
+    $correct = $tp + $tn
+
+    $strictAccuracy = 0
+    if ($total -gt 0) {
+        $strictAccuracy = [math]::Round($correct / $total, 4)
+    }
+    $decidedAccuracy = $null
+    if ($decided -gt 0) {
+        $decidedAccuracy = [math]::Round($correct / $decided, 4)
+    }
+    $precision = $null
+    if (($tp + $fp) -gt 0) {
+        $precision = [math]::Round($tp / ($tp + $fp), 4)
+    }
+    $recall = $null
+    if (($tp + $fn) -gt 0) {
+        $recall = [math]::Round($tp / ($tp + $fn), 4)
+    }
+    $f1 = $null
+    if ($null -ne $precision -and $null -ne $recall -and ($precision + $recall) -gt 0) {
+        $f1 = [math]::Round((2 * $precision * $recall) / ($precision + $recall), 4)
+    }
+
+    [pscustomobject]@{
+        runner = $RunnerName
+        total = $total
+        decided = $decided
+        correct = $correct
+        TP = $tp
+        FP = $fp
+        TN = $tn
+        FN = $fn
+        inconclusive = $inconclusive
+        parse_error = $parseErrors
+        execution_error = $executionErrors
+        strict_accuracy = $strictAccuracy
+        decided_accuracy = $decidedAccuracy
+        precision = $precision
+        recall = $recall
+        f1 = $f1
+    }
+}
+
+function Write-ScoreArtifacts {
+    param(
+        [string]$RunnerName,
+        [string]$BaseUrlValue,
+        [string]$ExpectedResultsCsvValue,
+        [string]$CasesPathValue,
+        [object[]]$Cases,
+        [object[]]$Results,
+        [string]$OutputDirValue
+    )
+
+    $summary = New-ScoreSummary $RunnerName $Results
+    $score = [pscustomobject]@{
+        runner = $RunnerName
+        base_url = $BaseUrlValue
+        expected_results_csv = $ExpectedResultsCsvValue
+        cases_path = $CasesPathValue
+        summary = $summary
+        results = $Results
+    }
+
+    $scorePath = Join-Path $OutputDirValue "score.json"
+    $csvPath = Join-Path $OutputDirValue "score.csv"
+    $coveragePlanPath = Join-Path $OutputDirValue "tool-coverage-plan.md"
+    $score | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $scorePath -Encoding UTF8
+    $Results | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+    New-ToolCoveragePlan $Cases $Results | Set-Content -LiteralPath $coveragePlanPath -Encoding UTF8
+
+    return $summary
+}
+
+function Read-PartialResults {
+    param(
+        [string[]]$ResultDirs,
+        [object[]]$Cases
+    )
+
+    $byId = @{}
+    foreach ($dir in $ResultDirs) {
+        $partialDir = Join-Path $dir "partial-results"
+        if (-not (Test-Path -LiteralPath $partialDir)) {
+            continue
+        }
+        foreach ($file in Get-ChildItem -LiteralPath $partialDir -Filter "*.result.json") {
+            try {
+                $result = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
+                if ($result.id) {
+                    $byId["$($result.id)"] = $result
+                }
+            } catch {
+                Write-Warning "Ignoring unreadable partial result $($file.FullName): $_"
+            }
+        }
+    }
+
+    $ordered = @()
+    foreach ($case in $Cases) {
+        $id = Get-PropertyValue $case @("id", "test_name", "# test name")
+        if ($byId.ContainsKey($id)) {
+            $ordered += $byId[$id]
+        }
+    }
+    return @($ordered)
+}
+
+function Invoke-ParallelScoreRun {
+    param(
+        [object[]]$Cases,
+        [int]$JobCount,
+        [string]$OutputDirValue,
+        [string]$RunnerName,
+        [string]$BaseUrlValue,
+        [string]$ExpectedResultsCsvValue,
+        [string]$ReportOutputValue,
+        [string]$SpaCommand,
+        [string]$CodexCommandValue,
+        [string]$CodexModelValue,
+        [string[]]$CodexExtraArgsValue,
+        [int]$MaxTokensValue,
+        [switch]$DryRunValue
+    )
+
+    if (-not $PSCommandPath) {
+        throw "-Jobs requires running this script from a file path."
+    }
+
+    $effectiveJobs = [math]::Min($JobCount, $Cases.Count)
+    $workersDir = Join-Path $OutputDirValue "workers"
+    New-Directory $workersDir
+
+    $processes = @()
+    $workerOutputDirs = @()
+    for ($worker = 0; $worker -lt $effectiveJobs; $worker++) {
+        $workerCases = @()
+        for ($index = $worker; $index -lt $Cases.Count; $index += $effectiveJobs) {
+            $workerCases += $Cases[$index]
+        }
+        if ($workerCases.Count -eq 0) {
+            continue
+        }
+
+        $workerName = "worker-$($worker + 1)"
+        $workerDir = Join-Path $workersDir $workerName
+        $workerCasesPath = Join-Path $workersDir "$workerName.cases.json"
+        $stdoutPath = Join-Path $workersDir "$workerName.stdout.log"
+        $stderrPath = Join-Path $workersDir "$workerName.stderr.log"
+        New-Directory $workerDir
+        $workerCases | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $workerCasesPath -Encoding UTF8
+        $workerOutputDirs += $workerDir
+
+        $args = @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $PSCommandPath,
+            "-BaseUrl", $BaseUrlValue,
+            "-CasesPath", $workerCasesPath,
+            "-OutputDir", $workerDir,
+            "-Runner", $RunnerName,
+            "-Limit", "0",
+            "-ReportOutput", $ReportOutputValue,
+            "-Jobs", "1",
+            "-SkipHealthCheck"
+        )
+        if ($SpaCommand) {
+            $args += @("-SpaExe", $SpaCommand)
+        }
+        if ($CodexCommandValue) {
+            $args += @("-CodexCommand", $CodexCommandValue)
+        }
+        if ($CodexModelValue) {
+            $args += @("-CodexModel", $CodexModelValue)
+        }
+        if ($CodexExtraArgsValue -and $CodexExtraArgsValue.Count -gt 0) {
+            $args += @("-CodexExtraArgs")
+            $args += $CodexExtraArgsValue
+        }
+        if ($MaxTokensValue -gt 0) {
+            $args += @("-MaxTokens", "$MaxTokensValue")
+        }
+        if ($DryRunValue) {
+            $args += "-DryRun"
+        }
+        if ($RunnerName -eq "codex") {
+            $args += @("-CodexWorkDir", (Join-Path $workerDir "codex-workdir"))
+        }
+
+        $process = Start-Process -FilePath "powershell.exe" `
+            -ArgumentList $args `
+            -WorkingDirectory (Get-Location).Path `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath `
+            -WindowStyle Hidden `
+            -PassThru
+
+        $processes += [pscustomobject]@{
+            name = $workerName
+            process = $process
+            output_dir = $workerDir
+            stdout = $stdoutPath
+            stderr = $stderrPath
+            cases = $workerCases.Count
+        }
+    }
+
+    Write-Host "Started $($processes.Count) $RunnerName worker(s) for $($Cases.Count) case(s)."
+    do {
+        $running = @()
+        foreach ($entry in $processes) {
+            $entry.process.Refresh()
+            if (-not $entry.process.HasExited) {
+                $running += $entry
+            }
+        }
+        $results = @(Read-PartialResults $workerOutputDirs $Cases)
+        Write-Host "Parallel progress: $(@($results).Count)/$($Cases.Count) case(s) complete; running workers: $($running.Count)."
+        if ($running.Count -gt 0) {
+            Start-Sleep -Seconds 30
+        }
+    } while ($running.Count -gt 0)
+
+    foreach ($entry in $processes) {
+        $entry.process.WaitForExit()
+        $entry.process.Refresh()
+        if ($null -ne $entry.process.ExitCode -and $entry.process.ExitCode -ne 0) {
+            Write-Warning "$($entry.name) exited with code $($entry.process.ExitCode). See $($entry.stdout) and $($entry.stderr)."
+        }
+    }
+
+    $results = @(Read-PartialResults $workerOutputDirs $Cases)
+    $summary = Write-ScoreArtifacts `
+        -RunnerName $RunnerName `
+        -BaseUrlValue $BaseUrlValue `
+        -ExpectedResultsCsvValue $ExpectedResultsCsvValue `
+        -CasesPathValue "" `
+        -Cases $Cases `
+        -Results $results `
+        -OutputDirValue $OutputDirValue
+
+    if (@($results).Count -lt $Cases.Count) {
+        Write-Warning "Only $(@($results).Count)/$($Cases.Count) case(s) completed. Partial worker results were preserved under $workersDir."
+    }
+
+    Write-Host "OWASP Benchmark $RunnerName parallel scoring complete."
+    Write-Host "Score: $(Join-Path $OutputDirValue 'score.json')"
+    Write-Host "CSV: $(Join-Path $OutputDirValue 'score.csv')"
+    Write-Host "Tool coverage plan: $(Join-Path $OutputDirValue 'tool-coverage-plan.md')"
+    $summary | Format-List
+}
+
 New-Directory $OutputDir
 $promptsDir = Join-Path $OutputDir "prompts"
 $logsDir = Join-Path $OutputDir "logs"
+$partialDir = Join-Path $OutputDir "partial-results"
 New-Directory $promptsDir
 New-Directory $logsDir
+New-Directory $partialDir
 
 if (-not $SkipHealthCheck) {
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
@@ -515,6 +780,26 @@ if ($Limit -gt 0) {
 if ($cases.Count -eq 0) {
     throw "No benchmark cases were loaded."
 }
+if ($Jobs -lt 1) {
+    throw "Jobs must be greater than zero."
+}
+if ($Jobs -gt 1 -and $cases.Count -gt 1) {
+    Invoke-ParallelScoreRun `
+        -Cases $cases `
+        -JobCount $Jobs `
+        -OutputDirValue $OutputDir `
+        -RunnerName $Runner `
+        -BaseUrlValue $BaseUrl `
+        -ExpectedResultsCsvValue $ExpectedResultsCsv `
+        -ReportOutputValue $ReportOutput `
+        -SpaCommand $spaCommand `
+        -CodexCommandValue $codexCommandResolved `
+        -CodexModelValue $CodexModel `
+        -CodexExtraArgsValue $CodexExtraArgs `
+        -MaxTokensValue $MaxTokens `
+        -DryRunValue:$DryRun
+    exit
+}
 
 $results = @()
 try {
@@ -537,7 +822,14 @@ try {
         $promptPath = Join-Path $promptsDir "$safeId.prompt.txt"
         $logPath = Join-Path $logsDir "$safeId.stdout.txt"
         $lastMessagePath = Join-Path $logsDir "$safeId.codex-last-message.txt"
+        $partialPath = Join-Path $partialDir "$safeId.result.json"
         Set-Content -LiteralPath $promptPath -Value $prompt -Encoding UTF8
+
+        if (Test-Path -LiteralPath $partialPath) {
+            Write-Host "[$index/$($cases.Count)] Reusing partial $Runner $id"
+            $results += Get-Content -LiteralPath $partialPath -Raw | ConvertFrom-Json
+            continue
+        }
 
         $expected = Convert-ExpectedValueToBool (Get-PropertyValue $case @("expected_vulnerable", "vulnerable", "real vulnerability", "real_vulnerability"))
         $startedAt = Get-Date
@@ -612,7 +904,7 @@ try {
             $outcome = "execution_error"
         }
 
-        $results += [pscustomobject]@{
+        $result = [pscustomobject]@{
             id = $id
             category = Get-PropertyValue $case @("category", "Category")
             cwe = Get-PropertyValue $case @("cwe", "CWE")
@@ -631,81 +923,25 @@ try {
             started_at = $startedAt.ToString("o")
             ended_at = $endedAt.ToString("o")
         }
+        $result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $partialPath -Encoding UTF8
+        $results += $result
     }
 } finally {
 }
 
-$total = $results.Count
-$tp = @($results | Where-Object { $_.outcome -eq "TP" }).Count
-$fp = @($results | Where-Object { $_.outcome -eq "FP" }).Count
-$tn = @($results | Where-Object { $_.outcome -eq "TN" }).Count
-$fn = @($results | Where-Object { $_.outcome -eq "FN" }).Count
-$inconclusive = @($results | Where-Object { $_.outcome -eq "inconclusive" }).Count
-$parseErrors = @($results | Where-Object { $_.outcome -eq "parse_error" }).Count
-$executionErrors = @($results | Where-Object { $_.outcome -eq "execution_error" }).Count
-$decided = $tp + $fp + $tn + $fn
-$correct = $tp + $tn
-
-$strictAccuracy = 0
-if ($total -gt 0) {
-    $strictAccuracy = [math]::Round($correct / $total, 4)
-}
-$decidedAccuracy = $null
-if ($decided -gt 0) {
-    $decidedAccuracy = [math]::Round($correct / $decided, 4)
-}
-$precision = $null
-if (($tp + $fp) -gt 0) {
-    $precision = [math]::Round($tp / ($tp + $fp), 4)
-}
-$recall = $null
-if (($tp + $fn) -gt 0) {
-    $recall = [math]::Round($tp / ($tp + $fn), 4)
-}
-$f1 = $null
-if ($null -ne $precision -and $null -ne $recall -and ($precision + $recall) -gt 0) {
-    $f1 = [math]::Round((2 * $precision * $recall) / ($precision + $recall), 4)
-}
-
-$summary = [pscustomobject]@{
-    runner = $Runner
-    total = $total
-    decided = $decided
-    correct = $correct
-    TP = $tp
-    FP = $fp
-    TN = $tn
-    FN = $fn
-    inconclusive = $inconclusive
-    parse_error = $parseErrors
-    execution_error = $executionErrors
-    strict_accuracy = $strictAccuracy
-    decided_accuracy = $decidedAccuracy
-    precision = $precision
-    recall = $recall
-    f1 = $f1
-}
-
-$score = [pscustomobject]@{
-    runner = $Runner
-    base_url = $BaseUrl
-    expected_results_csv = $ExpectedResultsCsv
-    cases_path = $CasesPath
-    summary = $summary
-    results = $results
-}
-
-$scorePath = Join-Path $OutputDir "score.json"
-$csvPath = Join-Path $OutputDir "score.csv"
-$coveragePlanPath = Join-Path $OutputDir "tool-coverage-plan.md"
-$score | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $scorePath -Encoding UTF8
-$results | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
-New-ToolCoveragePlan $cases $results | Set-Content -LiteralPath $coveragePlanPath -Encoding UTF8
+$summary = Write-ScoreArtifacts `
+    -RunnerName $Runner `
+    -BaseUrlValue $BaseUrl `
+    -ExpectedResultsCsvValue $ExpectedResultsCsv `
+    -CasesPathValue $CasesPath `
+    -Cases $cases `
+    -Results $results `
+    -OutputDirValue $OutputDir
 
 Write-Host "OWASP Benchmark $Runner scoring complete."
-Write-Host "Score: $scorePath"
-Write-Host "CSV: $csvPath"
-Write-Host "Tool coverage plan: $coveragePlanPath"
+Write-Host "Score: $(Join-Path $OutputDir 'score.json')"
+Write-Host "CSV: $(Join-Path $OutputDir 'score.csv')"
+Write-Host "Tool coverage plan: $(Join-Path $OutputDir 'tool-coverage-plan.md')"
 if ($Runner -eq "spa") {
     Write-Host "SPA command: $spaCommand"
 } elseif ($Runner -eq "codex") {

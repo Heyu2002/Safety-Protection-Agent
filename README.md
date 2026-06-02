@@ -1,15 +1,43 @@
 # Safety Protection Agent
 
-[中文文档](README_CN.md)
+[Chinese documentation](README_CN.md)
 
-Safety Protection Agent (`spa`) is a Rust-based terminal security agent for
-authorized defensive testing, local lab validation, and repeatable vulnerability
-evaluation. It combines a Codex-style interactive loop, model tool calling, MCP
-integration, runtime skills, and built-in low-impact security checks.
+Safety Protection Agent (`spa`) is a Rust terminal agent for authorized
+defensive testing, local lab validation, and repeatable vulnerability
+evaluation. It combines a Codex-style agent loop, model tool calling, MCP
+integration, runtime skills, context compaction, and built-in low-impact
+security tools.
 
-`spa` is intended only for owned systems, local labs, and explicitly authorized
-targets. Do not use it for unauthorized access, stealth, persistence, data theft,
-or bypassing permission boundaries.
+Use `spa` only on owned systems, local labs, benchmark targets, staging
+environments, or explicitly authorized scopes. Do not use it for unauthorized
+access, stealth, persistence, data theft, or bypassing permission boundaries.
+
+## Current Evaluation Summary
+
+Latest local OWASP Benchmark random-sample run, updated on 2026-06-02:
+
+- Sample: 30 fully random OWASP Benchmark cases
+- Seed: `849023657`
+- Case manifest: `target/owasp-benchmark-random-30-current/cases-random-30.json`
+- SPA score: `target/owasp-benchmark-random-30-current/spa-after-tool-fixes-30-final/score.json`
+- Codex comparison score: `target/owasp-benchmark-random-30-current/codex-jobs-3/score.json`
+
+| Runner | Cases | Correct | TP | FP | TN | FN | Inconclusive | Execution errors | Accuracy | Precision | Recall | F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| spa | 30 | 30 | 20 | 0 | 10 | 0 | 0 | 0 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| codex | 30 | 29 | 20 | 1 | 9 | 0 | 0 | 0 | 0.9667 | 0.9524 | 1.0000 | 0.9756 |
+
+This snapshot reflects the current tool fixes for:
+
+- SQLi and trust-boundary semantic flow through request arrays, headers,
+  cookies, `StringBuilder`, lists/maps, inner methods, inline conditionals, and
+  Spring `JDBCtemplate` sinks.
+- Crypto semantic detection for `Cipher.getInstance(variable)` defaults and
+  weak `KeyGenerator` algorithms.
+- Weak-randomness classification that distinguishes `SecureRandom` instances
+  from `java.util.Random` declaration types.
+- Path-traversal active-probe confirmation that requires payload-controlled
+  file behavior rather than a fixed file-operation banner.
 
 ## Quick Start
 
@@ -64,7 +92,23 @@ native tool payloads:
 LLM_NATIVE_TOOLS=false
 ```
 
-To allow completed Markdown reports to be written by the report tool, set:
+Automatic context compaction is enabled by default. The agent estimates the
+next request size and compacts conversation history at 90% of the configured
+context window.
+
+```env
+LLM_AUTO_COMPACT=true
+LLM_CONTEXT_WINDOW=128000
+LLM_AUTO_COMPACT_PERCENT=90
+```
+
+Set an explicit lower limit when using smaller local or relay models:
+
+```env
+LLM_AUTO_COMPACT_TOKEN_LIMIT=32768
+```
+
+To allow completed Markdown reports to be written by the report tool:
 
 ```env
 SPA_AGENT_REPORT_DIR=reports
@@ -72,6 +116,26 @@ SPA_AGENT_REPORT_DIR=reports
 
 Reports are written only when the model explicitly calls
 `generate_markdown_report` after a report is complete.
+
+## Built-in Tools
+
+Built-in tools focus on evidence-based, bounded checks:
+
+- `http_active_probe_scan`
+- `http_security_headers_scan`
+- `database_risk_scan`
+- `xss_risk_scan`
+- `weak_session_id_scan`
+- `java_injection_semantic_scan`
+- `java_crypto_semantic_scan`
+- `java_randomness_semantic_scan`
+- `http_load_test`
+- `generate_markdown_report`
+
+The Java semantic tools are primarily used for benchmark and lab cases where
+black-box responses are intentionally collapsed or too generic. They inspect
+source-level evidence for SQL/LDAP/XPath injection, trust-boundary flow, weak
+crypto, weak hashing, and weak randomness.
 
 ## MCP Integration
 
@@ -85,13 +149,13 @@ spa mcp list
 Configured MCP tools are exposed to the model at the beginning of each agent
 turn. The model decides whether to call them.
 
-`spa` can also run as an MCP server:
+Run `spa` as an MCP server:
 
 ```powershell
 cargo run --bin spa-mcp
 ```
 
-The agent red-team lab MCP server is separate:
+Run the agent red-team lab MCP server:
 
 ```powershell
 cargo run --bin spa-agent-lab-mcp
@@ -100,7 +164,7 @@ cargo run --bin spa-agent-lab-mcp
 ## Runtime Skills
 
 Runtime skills live in `skills/`. The host exposes the skill catalog to the
-model, the model selects relevant skills, and the selected `SKILL.md` bodies are
+model, the model selects relevant skills, and selected `SKILL.md` bodies are
 added to the agent context.
 
 Included skills:
@@ -115,46 +179,43 @@ Create a new skill:
 powershell -ExecutionPolicy Bypass -File .\scripts\new-skill.ps1 -Name skill-name -Description "Use when ..."
 ```
 
-## Built-in Tools
-
-Built-in tools focus on evidence-based, low-impact checks and report generation:
-
-- `http_security_headers_scan`
-- `database_risk_scan`
-- `xss_risk_scan`
-- `weak_session_id_scan`
-- `http_load_test`
-- `generate_markdown_report`
-
-Formal reports should include scope, coverage, attack types, findings, evidence,
-and fixes.
-
-## Evaluation Snapshot
-
-The included OWASP Benchmark comparison covers 30 common cases from the 2,740
-case truth set. Source report path in this workspace:
-`target/owasp-benchmark-agent-comparison-30/comparison.md`.
-
-Generated at: `2026-05-29T19:51:11.1365400+08:00`
-
-| Agent | Cases | Correct | TP | FP | TN | FN | Inconclusive | Avg seconds/case | Accuracy | Estimated full hours | Recall |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| spa | 30 | 22 | 15 | 2 | 7 | 2 | 4 | 71.4 | 0.7333 | 54.3 | 0.8824 |
-| codex | 30 | 23 | 14 | 1 | 9 | 2 | 4 | 394.3 | 0.7667 | 300.1 | 0.875 |
-
 ## OWASP Benchmark Evaluation
 
-OWASP Benchmark can be used as a repeatable web vulnerability evaluation target.
-Start the Benchmark app separately, then run a small SPA evaluation set:
+Start OWASP Benchmark separately, then run a score pass:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\eval-owasp-benchmark.ps1 `
+powershell -ExecutionPolicy Bypass -File .\scripts\eval-owasp-benchmark-score.ps1 `
   -BaseUrl https://localhost:8443/benchmark `
-  -ExpectedResultsCsv path\to\expectedresults.csv `
-  -Limit 10
+  -CasesPath target\owasp-benchmark-random-30-current\cases-random-30.json `
+  -OutputDir target\owasp-benchmark-random-30-current\spa `
+  -Runner spa `
+  -Limit 0 `
+  -ReportOutput off
 ```
 
-Use `-DryRun` to generate prompts and result files without calling `spa`.
+Use `-Runner codex` to compare Codex CLI behavior. Codex runs can be parallelized
+and resumed with partial result files:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\eval-owasp-benchmark-score.ps1 `
+  -BaseUrl https://localhost:8443/benchmark `
+  -CasesPath target\owasp-benchmark-random-30-current\cases-random-30.json `
+  -OutputDir target\owasp-benchmark-random-30-current\codex-jobs-3 `
+  -Runner codex `
+  -Jobs 3 `
+  -Limit 0 `
+  -ReportOutput off
+```
+
+The scoring script writes:
+
+- `score.json`
+- `score.csv`
+- `tool-coverage-plan.md`
+- per-case logs
+- resumable `partial-results/*.result.json`
+
+Use `-DryRun` to generate prompts and result files without calling the runner.
 
 ## Development
 

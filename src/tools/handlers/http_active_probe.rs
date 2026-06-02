@@ -588,11 +588,12 @@ fn classify_signals(
         ProbeKind::PathTraversal => {
             if lower.contains("the beginning of file")
                 || lower.contains("fileinputstream")
-                || lower.contains("now ready to write to file")
                 || lower.contains("secret file")
                 || lower.contains("safe text")
                 || lower.contains("contents of")
                 || lower.contains("web-app")
+                || (lower.contains("now ready to write to file")
+                    && path_response_mentions_payload(body, &probe.payload))
             {
                 signals.insert("file_read_or_write_signal".to_owned());
             }
@@ -644,6 +645,22 @@ fn is_confirmed_signal(signal: &str) -> bool {
             | "ldap_result_signal"
             | "session_attribute_influence_signal"
     )
+}
+
+fn path_response_mentions_payload(body: &str, payload: &str) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+    if body.contains(payload) {
+        return true;
+    }
+    let normalized = payload.replace("%2f", "/").replace("%2F", "/");
+    let token = normalized
+        .split(['/', '\\'])
+        .next_back()
+        .unwrap_or(normalized.as_str())
+        .trim();
+    !token.is_empty() && body.contains(token)
 }
 
 fn report_risk_level(
@@ -1078,6 +1095,30 @@ mod tests {
         let signals = classify_signals(&ProbeKind::PathTraversal, &baseline, &response, &probe);
 
         assert!(signals.contains(&"file_read_or_write_signal".to_owned()));
+    }
+
+    #[test]
+    fn path_traversal_write_banner_without_payload_is_not_confirmed() {
+        let baseline = ProbeResponse {
+            status: 200,
+            body: "Now ready to write to file: C:\\testfiles\\bar".to_owned(),
+            elapsed_ms: 1,
+        };
+        let response = ProbeResponse {
+            status: 200,
+            body: "Now ready to write to file: C:\\testfiles\\bar".to_owned(),
+            elapsed_ms: 1,
+        };
+        let probe = ProbeAttempt {
+            location: InputLocation::Query,
+            field: "vector".to_owned(),
+            payload: "FileName".to_owned(),
+            marker: None,
+        };
+
+        let signals = classify_signals(&ProbeKind::PathTraversal, &baseline, &response, &probe);
+
+        assert!(!signals.contains(&"file_read_or_write_signal".to_owned()));
     }
 
     #[test]
