@@ -14,20 +14,28 @@ access, stealth, persistence, data theft, or bypassing permission boundaries.
 
 ## Current Evaluation Summary
 
-Latest local OWASP Benchmark random-sample run, updated on 2026-06-02:
+Local OWASP Benchmark sample summary, updated on 2026-06-02:
 
-- Sample: 30 fully random OWASP Benchmark cases
-- Seed: `849023657`
-- Case manifest: `target/owasp-benchmark-random-30-current/cases-random-30.json`
-- SPA score: `target/owasp-benchmark-random-30-current/spa-after-tool-fixes-30-final/score.json`
-- Codex comparison score: `target/owasp-benchmark-random-30-current/codex-jobs-3/score.json`
+- Combined sample: 60 OWASP Benchmark case rows
+- Source sets: previous summary 30 + current fully random 30
+- Current random seed: `849023657`
+- Duplicate case IDs between the two sets: 0
+- Previous comparison report: `target/owasp-benchmark-agent-comparison-30/comparison.json`
+- Current case manifest: `target/owasp-benchmark-random-30-current/cases-random-30.json`
+- Current SPA score: `target/owasp-benchmark-random-30-current/spa-after-tool-fixes-30-final/score.json`
+- Current Codex comparison score: `target/owasp-benchmark-random-30-current/codex-jobs-3/score.json`
+
+The aggregate below combines the previous 30-case comparison
+(`spa` 22/30, `codex` 23/30) with the current random 30-case comparison
+(`spa` 30/30, `codex` 29/30). Accuracy is strict accuracy over all sampled
+rows; inconclusive results are not counted as correct.
 
 | Runner | Cases | Correct | TP | FP | TN | FN | Inconclusive | Execution errors | Accuracy | Precision | Recall | F1 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| spa | 30 | 30 | 20 | 0 | 10 | 0 | 0 | 0 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
-| codex | 30 | 29 | 20 | 1 | 9 | 0 | 0 | 0 | 0.9667 | 0.9524 | 1.0000 | 0.9756 |
+| spa | 60 | 52 | 35 | 2 | 17 | 2 | 4 | 0 | 0.8667 | 0.9459 | 0.9459 | 0.9459 |
+| codex | 60 | 52 | 34 | 2 | 18 | 2 | 4 | 0 | 0.8667 | 0.9444 | 0.9444 | 0.9444 |
 
-This snapshot reflects the current tool fixes for:
+The current random 30-case run reflects the latest tool fixes for:
 
 - SQLi and trust-boundary semantic flow through request arrays, headers,
   cookies, `StringBuilder`, lists/maps, inner methods, inline conditionals, and
