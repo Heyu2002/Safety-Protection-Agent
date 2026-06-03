@@ -7,6 +7,7 @@ mod java_crypto_semantic;
 mod java_injection_semantic;
 mod java_randomness_semantic;
 mod markdown_report;
+mod software_agent_chat;
 mod weak_session_id;
 mod xss_risk;
 
@@ -19,5 +20,6 @@ pub use java_crypto_semantic::JavaCryptoSemanticScanTool;
 pub use java_injection_semantic::JavaInjectionSemanticScanTool;
 pub use java_randomness_semantic::JavaRandomnessSemanticScanTool;
 pub use markdown_report::GenerateMarkdownReportTool;
+pub use software_agent_chat::SoftwareAgentChatTool;
 pub use weak_session_id::WeakSessionIdScanTool;
 pub use xss_risk::XssRiskScanTool;

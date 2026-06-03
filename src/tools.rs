@@ -9,8 +9,8 @@ pub use error::{Result, ToolError};
 pub use handlers::{
     DatabaseRiskScanTool, EchoTool, GenerateMarkdownReportTool, HttpActiveProbeScanTool,
     HttpLoadTestTool, HttpSecurityHeadersScanTool, JavaCryptoSemanticScanTool,
-    JavaInjectionSemanticScanTool, JavaRandomnessSemanticScanTool, WeakSessionIdScanTool,
-    XssRiskScanTool,
+    JavaInjectionSemanticScanTool, JavaRandomnessSemanticScanTool, SoftwareAgentChatTool,
+    WeakSessionIdScanTool, XssRiskScanTool,
 };
 pub use registry::{BuiltinToolOptions, ToolHandler, ToolRegistry, ToolRegistryBuilder};
 pub use router::ToolRouter;

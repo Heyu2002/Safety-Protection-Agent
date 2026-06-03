@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use super::{
     DatabaseRiskScanTool, EchoTool, GenerateMarkdownReportTool, HttpActiveProbeScanTool,
     HttpLoadTestTool, HttpSecurityHeadersScanTool, JavaCryptoSemanticScanTool,
-    JavaInjectionSemanticScanTool, JavaRandomnessSemanticScanTool, Result, ToolCall, ToolError,
-    ToolOutput, ToolProgressCallback, ToolSpec, WeakSessionIdScanTool, XssRiskScanTool,
+    JavaInjectionSemanticScanTool, JavaRandomnessSemanticScanTool, Result, SoftwareAgentChatTool,
+    ToolCall, ToolError, ToolOutput, ToolProgressCallback, ToolSpec, WeakSessionIdScanTool,
+    XssRiskScanTool,
 };
 
 #[async_trait]
@@ -60,7 +61,8 @@ impl ToolRegistry {
             .register(JavaRandomnessSemanticScanTool)?
             .register(DatabaseRiskScanTool)?
             .register(WeakSessionIdScanTool)?
-            .register(XssRiskScanTool)?;
+            .register(XssRiskScanTool)?
+            .register(SoftwareAgentChatTool)?;
 
         let builder = if options.include_markdown_report {
             builder.register(GenerateMarkdownReportTool)?

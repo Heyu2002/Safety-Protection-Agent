@@ -138,7 +138,12 @@ Built-in tools focus on evidence-based, bounded checks:
 - `java_crypto_semantic_scan`
 - `java_randomness_semantic_scan`
 - `http_load_test`
+- `software_agent_chat`
 - `generate_markdown_report`
+
+`software_agent_chat` lets SPA act as a user toward an authorized local CLI or
+software agent by launching a target command, sending a message/transcript over
+stdin or argument placeholders, and returning the target agent output.
 
 The Java semantic tools are primarily used for benchmark and lab cases where
 black-box responses are intentionally collapsed or too generic. They inspect
