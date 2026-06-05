@@ -136,20 +136,14 @@ function Convert-ValueToPromptText($Value) {
 }
 
 function New-BenchmarkPrompt($Case, [string]$TargetUrl) {
-    $id = Get-PropertyValue $Case @("id", "test_name", "# test name")
-    $category = Get-PropertyValue $Case @("category", "Category")
-    $vulnerable = Get-PropertyValue $Case @("vulnerable", "real vulnerability", "real_vulnerability")
-    $cwe = Get-PropertyValue $Case @("cwe", "CWE")
     $method = Get-PropertyValue $Case @("method")
     if (-not $method) {
         $method = "GET"
     }
-    $params = Convert-ValueToPromptText $Case.params
-    $notes = Get-PropertyValue $Case @("notes")
 
     $reportRequirement = if ($ReportOutput -eq "on") {
         @"
-4. Produce a formal Markdown report in Chinese. Include the case ID and vulnerability category in the report name.
+4. Produce a formal Markdown report in Chinese. Use the target host/path as the report name.
 5. Use the SPA website-report structure configured by the runtime skill: probe object inventory, attack sample coverage, findings, and recommendations.
 6. In attack coverage and findings, use the SPA four-level labels: 【高危】, 【危险】, 【警告】, or 【正常】.
 7. Call generate_markdown_report after the report is complete and include the returned report path in the final answer.
@@ -162,22 +156,18 @@ function New-BenchmarkPrompt($Case, [string]$TargetUrl) {
     }
 
     @"
-You are evaluating this local, authorized OWASP Benchmark case with low-impact web vulnerability checks.
+You are evaluating this local, authorized web target with low-impact black-box vulnerability checks.
 
-Target case:
-- Case ID: $id
+Target:
 - Target URL: $TargetUrl
 - Suggested method: $method
-- Vulnerability category: $category
-- CWE: $cwe
-- Expected vulnerable field for evaluation bookkeeping only: $vulnerable
-- Parameter/input hints: $params
-- Notes: $notes
 
 Requirements:
-1. Test only this single case. Do not expand to unrelated targets.
+1. Test only this single target URL and same-origin paths discovered from it. Do not expand to unrelated targets.
 2. Establish a baseline first, then use low-impact validation only. Do not destroy data or run load tests.
-3. If an input parameter is needed, actively try bounded common fields and locations for the weakness, including vector, case ID, visible fields, query, header, and cookie sources before asking for more data.
+3. Use black-box HTTP/browser evidence only. Do not inspect local source files, expected-results files, prior score files, generated reports, benchmark metadata, or any local artifacts that reveal the intended weakness.
+4. Do not use source/static semantic tools for this run, even if they are available.
+5. If an input parameter is needed, actively try a bounded set of common black-box fields and locations such as visible fields, existing query parameters, route/path terms, common query names, headers, and cookies before asking for more data.
 $reportRequirement
 "@
 }

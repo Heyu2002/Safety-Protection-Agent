@@ -254,6 +254,9 @@ fn analyze_java_injection_source(source: &str) -> InjectionAnalysis {
         }
     }
     for (needle, sink_name) in [
+        (".executeUpdate", "executeUpdate"),
+        (".addBatch", "addBatch"),
+        (".executeBatch", "executeBatch"),
         (".execute", "execute"),
         (".batchUpdate", "JDBCtemplate.batchUpdate"),
         (".query", "JDBCtemplate.query"),
@@ -496,15 +499,22 @@ fn infer_java_state_with_initial(source: &str, mut state: JavaState) -> JavaStat
         state.methods = extract_string_methods(source);
     }
     let mut pending = String::new();
+    let mut pending_in_switch_branch = false;
+    let mut switch_depth = 0usize;
+    let mut pending_switch = false;
     for raw_line in source.lines() {
+        let in_switch_branch =
+            update_switch_context(raw_line, &mut switch_depth, &mut pending_switch);
         let Some(line) = cleaned_statement_line(raw_line) else {
             continue;
         };
         if pending.is_empty() {
             pending.push_str(&line);
+            pending_in_switch_branch = in_switch_branch;
         } else {
             pending.push(' ');
             pending.push_str(line.trim());
+            pending_in_switch_branch |= in_switch_branch;
         }
         if !statement_is_complete(&pending) {
             continue;
@@ -512,6 +522,8 @@ fn infer_java_state_with_initial(source: &str, mut state: JavaState) -> JavaStat
 
         let statement = pending.trim().to_owned();
         pending.clear();
+        let statement_in_switch_branch = pending_in_switch_branch;
+        pending_in_switch_branch = false;
         if apply_state_mutation(&statement, &mut state) {
             continue;
         }
@@ -520,7 +532,7 @@ fn infer_java_state_with_initial(source: &str, mut state: JavaState) -> JavaStat
             continue;
         }
         if let Some((name, value)) = parse_string_assignment(&statement, &state) {
-            state.strings.insert(name, value);
+            assign_string_state(&mut state, name, value, statement_in_switch_branch);
         }
     }
     if !pending.trim().is_empty() {
@@ -529,10 +541,47 @@ fn infer_java_state_with_initial(source: &str, mut state: JavaState) -> JavaStat
             return state;
         }
         if let Some((name, value)) = parse_string_assignment(statement, &state) {
-            state.strings.insert(name, value);
+            assign_string_state(&mut state, name, value, pending_in_switch_branch);
         }
     }
     state
+}
+
+fn assign_string_state(state: &mut JavaState, name: String, value: ValueState, branch_merge: bool) {
+    let value = if branch_merge {
+        state
+            .strings
+            .get(&name)
+            .cloned()
+            .map(|existing| combine_branch_states(existing, value.clone()))
+            .unwrap_or(value)
+    } else {
+        value
+    };
+    state.strings.insert(name, value);
+}
+
+fn update_switch_context(
+    raw_line: &str,
+    switch_depth: &mut usize,
+    pending_switch: &mut bool,
+) -> bool {
+    let line = strip_line_comment(raw_line).trim();
+    let opens_switch = line.starts_with("switch ") || line.starts_with("switch(");
+    if opens_switch {
+        *pending_switch = true;
+    }
+
+    let (opens, closes) = brace_counts_outside_strings(line);
+    if *switch_depth > 0 || *pending_switch {
+        *switch_depth = switch_depth.saturating_add(opens);
+        *switch_depth = switch_depth.saturating_sub(closes);
+        if opens > 0 {
+            *pending_switch = false;
+        }
+    }
+
+    *switch_depth > 0 && !opens_switch
 }
 
 fn statement_is_complete(statement: &str) -> bool {
@@ -552,6 +601,11 @@ fn cleaned_statement_line(raw_line: &str) -> Option<String> {
         || line.starts_with("else")
         || line.starts_with("for ")
         || line.starts_with("while ")
+        || line.starts_with("case ")
+        || line.starts_with("default:")
+        || line == "default"
+        || line == "break;"
+        || line.starts_with("break ")
         || line.starts_with("try")
         || line.starts_with("catch")
         || line.starts_with("return")
@@ -604,6 +658,36 @@ fn strip_line_comment(line: &str) -> &str {
         }
     }
     line
+}
+
+fn brace_counts_outside_strings(line: &str) -> (usize, usize) {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut opens = 0usize;
+    let mut closes = 0usize;
+    for ch in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if ch == '{' {
+            opens += 1;
+        } else if ch == '}' {
+            closes += 1;
+        }
+    }
+    (opens, closes)
 }
 
 fn apply_state_mutation(statement: &str, state: &mut JavaState) -> bool {
@@ -667,6 +751,12 @@ fn parse_request_collection_source_assignment(statement: &str) -> Option<(String
     }
     if expr.contains("request.getCookies(") {
         return Some((name, ValueState::Tainted("request.getCookies()".to_owned())));
+    }
+    if expr.contains("request.getQueryString(") {
+        return Some((
+            name,
+            ValueState::Tainted("request.getQueryString()".to_owned()),
+        ));
     }
     None
 }
@@ -883,6 +973,9 @@ fn eval_string_expr_with_depth(expr: &str, state: &JavaState, depth: usize) -> V
     }
     if expr.contains("request.getParameterValues(") {
         return ValueState::Tainted(http_source("request.getParameterValues", expr));
+    }
+    if expr.contains("request.getQueryString(") {
+        return ValueState::Tainted("request.getQueryString()".to_owned());
     }
     if expr.contains(".getTheParameter(") || expr.contains(".getTheCookie(") {
         return ValueState::Tainted(http_source("benchmark helper request source", expr));
@@ -1865,6 +1958,106 @@ mod tests {
 
         assert_eq!(analysis.findings[0].risk_level, DANGER);
         assert_eq!(analysis.findings[0].category, "sql_injection_tainted_sink");
+    }
+
+    #[test]
+    fn classifies_cookie_list_execute_update_as_danger() {
+        let source = r#"
+            javax.servlet.http.Cookie[] theCookies = request.getCookies();
+            String param = "";
+            param = java.net.URLDecoder.decode(theCookie.getValue(), "UTF-8");
+            java.util.List<String> list = new java.util.ArrayList<String>();
+            list.add("safe");
+            list.add(param);
+            String bar = list.get(1);
+            String sql = "UPDATE USERS SET PASSWORD='" + bar + "'";
+            statement.executeUpdate(sql);
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert_eq!(analysis.findings[0].risk_level, DANGER);
+        assert_eq!(analysis.findings[0].sink, "executeUpdate");
+    }
+
+    #[test]
+    fn classifies_map_flow_add_batch_as_danger() {
+        let source = r#"
+            String param = request.getParameter("vector");
+            java.util.HashMap<String,Object> map = new java.util.HashMap<String,Object>();
+            map.put("keyA", "safe");
+            map.put("keyB", param);
+            String bar = (String)map.get("keyB");
+            String sql = "SELECT * from USERS where PASSWORD='" + bar + "'";
+            statement.addBatch(sql);
+            statement.executeBatch();
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert!(
+            analysis
+                .findings
+                .iter()
+                .any(|finding| finding.risk_level == DANGER && finding.sink == "addBatch")
+        );
+    }
+
+    #[test]
+    fn classifies_query_string_execute_update_as_danger() {
+        let source = r#"
+            String queryString = request.getQueryString();
+            String param = queryString.substring(0, queryString.length());
+            String sql = "UPDATE USERS SET PASSWORD='" + param + "'";
+            statement.executeUpdate(sql, java.sql.Statement.RETURN_GENERATED_KEYS);
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert_eq!(analysis.findings[0].risk_level, DANGER);
+        assert_eq!(analysis.findings[0].sink, "executeUpdate");
+    }
+
+    #[test]
+    fn classifies_switch_branch_parameter_values_add_batch_as_danger() {
+        let source = r#"
+            String[] values = request.getParameterValues("vector");
+            String param;
+            param = values[0];
+            String bar = new Test().doSomething(param);
+            String sql = "SELECT * from USERS where PASSWORD='" + bar + "'";
+            statement.addBatch(sql);
+            statement.executeBatch();
+
+            private class Test {
+                public String doSomething(String param) {
+                    String bar;
+                    String guess = "ABC";
+                    char switchTarget = guess.charAt(2);
+                    switch (switchTarget) {
+                        case 'A':
+                            bar = "safe";
+                            break;
+                        case 'C':
+                            bar = param;
+                            break;
+                        default:
+                            bar = "fallback";
+                            break;
+                    }
+                    return bar;
+                }
+            }
+        "#;
+
+        let analysis = analyze_java_injection_source(source);
+
+        assert!(
+            analysis
+                .findings
+                .iter()
+                .any(|finding| finding.risk_level == DANGER && finding.sink == "addBatch")
+        );
     }
 
     #[test]

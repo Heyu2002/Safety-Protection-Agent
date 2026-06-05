@@ -101,7 +101,10 @@ function Read-BenchmarkCases {
             throw "CasesPath not found: $CasesPath"
         }
         $raw = Get-Content -LiteralPath $CasesPath -Raw
-        return @($raw | ConvertFrom-Json)
+        foreach ($case in @($raw | ConvertFrom-Json)) {
+            $case
+        }
+        return
     }
 
     if ($ExpectedResultsCsv) {
@@ -124,7 +127,10 @@ function Read-BenchmarkCases {
                 $cases += $case
             }
         }
-        return $cases
+        foreach ($case in $cases) {
+            $case
+        }
+        return
     }
 
     throw "Provide -ExpectedResultsCsv from OWASP Benchmark or -CasesPath with a JSON case manifest."
@@ -157,45 +163,36 @@ function Resolve-CodexCommand([string]$Requested) {
 }
 
 function New-ScorePrompt($Case, [string]$TargetUrl) {
-    $id = Get-PropertyValue $Case @("id", "test_name", "# test name")
-    $category = Get-PropertyValue $Case @("category", "Category")
-    $cwe = Get-PropertyValue $Case @("cwe", "CWE")
     $method = Get-PropertyValue $Case @("method")
     if (-not $method) {
         $method = "GET"
     }
 
     $promptLines = @(
-        "You are evaluating one local, authorized OWASP Benchmark case.",
+        "You are evaluating one local, authorized web target.",
         "",
         "Task:",
-        "Decide whether this exact target is vulnerable for the focused weakness. This is a blind scoring run. Use the same active probing workflow as normal SPA web vulnerability discovery; only the final output contract is score-oriented.",
+        "Decide whether this exact target appears vulnerable based only on black-box runtime behavior. This is a blind scoring run; only the final output contract is score-oriented.",
         "",
         "Target:",
-        "- Case ID: $id",
         "- Target URL: $TargetUrl",
         "- Suggested method: $method",
-        "- Focus category: $category",
-        "- Focus CWE: $cwe",
         "",
         "Rules:",
-        "1. Test only this single case. Do not expand to unrelated targets.",
+        "1. Test only this single target URL and same-origin paths discovered from it. Do not expand to unrelated targets.",
         "2. Use low-impact checks only. Do not destroy data, exfiltrate secrets, run load tests, or persist changes.",
-        "3. If the page exposes no parameter, try only a small set of reasonable parameters and locations for this weakness, including vector, case ID, common query fields, headers, and cookies.",
-        "4. Judge from runtime HTTP/browser evidence first. Hash/crypto/weakrand cases may use an available source/static semantic tool for this single case to identify the algorithm, cipher mode, or randomness API. SQLi/LDAPI/XPathi/trustbound cases may use an available source/static semantic tool for this single case when runtime responses are collapsed or do not expose a usable delta. Do not inspect expected-results files or prior score files, and do not call the spa binary to answer this case.",
-        "5. The target is local authorized HTTPS and may use a self-signed certificate. If a client blocks local certificate validation, use a localhost-only certificate bypass and continue.",
-        "6. Do not assume the target is vulnerable just because this is OWASP Benchmark.",
-        "6a. For hash/crypto cases, generic runtime banners such as MessageDigest.getInstance or Cipher.getInstance executed are not enough. Use weak algorithm/mode evidence such as MD5, SHA-1, DES, RC4, ECB, or provider-default AES; if the algorithm cannot be identified, return inconclusive.",
-        "6b. For weakrand cases, generic runtime banners such as Weak Randomness Test executed are not enough. Use java_randomness_semantic_scan when available; java.util.Random, Math.random, or ThreadLocalRandom support vulnerable, while SecureRandom supports not_vulnerable unless predictable seeding is shown.",
-        "6c. For SQLi/LDAPI/XPathi/trustbound cases, if black-box probes hit a fixed generic response or no useful delta, use java_injection_semantic_scan with this case_id when available. Tainted request data reaching SQL/LDAP/XPath/session sinks supports vulnerable; constants or benchmark safe helpers reaching the sink support not_vulnerable.",
-        "6d. For trustbound cases, a reachable session write alone is not enough. Require user-controlled session key/value influence or source-level taint into setAttribute/putValue before returning vulnerable.",
-        "7. End your final answer with exactly one single-line JSON object and no Markdown after it.",
-        "8. The JSON object must contain these fields: case_id, verdict, confidence, evidence, tested_inputs.",
-        "9. verdict must be one of: vulnerable, not_vulnerable, inconclusive.",
+        "3. If the page exposes no parameter, try only a small bounded set of common black-box input locations such as visible form fields, existing query parameters, route/path terms, common query names, headers, and cookies.",
+        "4. Use black-box HTTP/browser evidence only. Do not inspect local source files, expected-results files, prior score files, generated reports, benchmark metadata, or any local artifacts that reveal the intended weakness.",
+        "5. Do not use source/static semantic tools for this scoring run, even if they are available. Do not call the spa binary to answer this target.",
+        "6. The target is local authorized HTTPS and may use a self-signed certificate. If a client blocks local certificate validation, use a localhost-only certificate bypass and continue.",
+        "7. Do not assume the target is vulnerable or safe because of its URL pattern, framework banner, or lab-like naming. Judge only from observed behavior.",
+        "8. End your final answer with exactly one single-line JSON object and no Markdown after it.",
+        "9. The JSON object must contain these fields: verdict, confidence, evidence, tested_inputs.",
+        "10. verdict must be one of: vulnerable, not_vulnerable, inconclusive.",
         "",
         "Verdict guidance:",
-        "- vulnerable: runtime evidence confirms the focused weakness, or a dangerous sink/security boundary is reachable with weakness-specific observable behavior in this authorized benchmark case.",
-        "- not_vulnerable: a valid baseline and representative focused low-impact checks across likely inputs found stable negative evidence.",
+        "- vulnerable: black-box runtime evidence shows a security weakness with a reproducible, low-impact signal.",
+        "- not_vulnerable: a valid baseline and representative low-impact checks across likely black-box inputs found stable negative evidence.",
         "- inconclusive: the target is unreachable, the correct input shape is unknown after bounded discovery, the baseline is unusable, or evidence is insufficient."
     )
     return ($promptLines -join [Environment]::NewLine)
@@ -227,6 +224,47 @@ function Invoke-SpaCase {
         output = @($output)
         exit_code = $exitCode
     }
+}
+
+function Test-RetryableSpaFailure {
+    param(
+        [object[]]$Output,
+        [int]$ExitCode
+    )
+
+    if ($ExitCode -eq 0) {
+        return $false
+    }
+    $text = (@($Output) -join "`n")
+    return ($text -match 'provider response did not contain text output' -or $text -match 'overflowed its stack')
+}
+
+function Test-ProviderEmptySpaFailure {
+    param(
+        [object[]]$Output,
+        [int]$ExitCode
+    )
+
+    if ($ExitCode -eq 0) {
+        return $false
+    }
+    $text = (@($Output) -join "`n")
+    return ($text -match 'provider response did not contain text output')
+}
+
+function New-ProviderEmptyInconclusiveOutput {
+    param(
+        [string]$CaseId
+    )
+
+    $verdict = [pscustomobject]@{
+        case_id = $CaseId
+        verdict = "inconclusive"
+        confidence = 0.0
+        evidence = @("spa provider returned no text output after retry")
+        tested_inputs = @()
+    }
+    return ($verdict | ConvertTo-Json -Compress)
 }
 
 function Invoke-CodexCase {
@@ -395,7 +433,7 @@ function New-CoverageInfo([string]$Status, [string]$Tools, [string]$Next) {
 function Get-ToolCoverageInfo([string]$Category) {
     $normalized = $Category.ToLowerInvariant()
     if ($normalized -eq "sqli") {
-        return [pscustomobject]@{ status = "covered-specific+static"; tools = "database_risk_scan, java_injection_semantic_scan"; next = "Expand SQL semantic rules for prepared bindings, sanitizers, and multi-method helper flows." }
+        return [pscustomobject]@{ status = "covered-specific-blackbox"; tools = "database_risk_scan"; next = "Expand black-box SQLi input discovery and signal handling. Keep source semantic scans for assisted regression only." }
     }
     if ($normalized -eq "xss") {
         return [pscustomobject]@{ status = "covered-specific"; tools = "xss_risk_scan"; next = "Use MCP browser evidence for DOM/execution confirmation when needed." }
@@ -410,22 +448,22 @@ function Get-ToolCoverageInfo([string]$Category) {
         return [pscustomobject]@{ status = "covered-generic"; tools = "http_active_probe_scan"; next = "Expand low-impact echo markers and header/cookie/source discovery." }
     }
     if ($normalized -eq "ldapi") {
-        return [pscustomobject]@{ status = "covered-generic+static"; tools = "http_active_probe_scan, java_injection_semantic_scan"; next = "Expand LDAP semantic rules for escaping helpers and multi-method dataflow." }
+        return [pscustomobject]@{ status = "covered-generic-blackbox"; tools = "http_active_probe_scan"; next = "Add LDAP-specific black-box payloads and response signals. Keep source semantic scans for assisted regression only." }
     }
     if ($normalized -eq "trustbound") {
-        return [pscustomobject]@{ status = "covered-generic+static"; tools = "http_active_probe_scan, java_injection_semantic_scan"; next = "Add second-read runtime verification for session/state-key influence." }
+        return [pscustomobject]@{ status = "covered-generic-blackbox"; tools = "http_active_probe_scan"; next = "Add second-read black-box runtime verification for session/state-key influence." }
     }
     if ($normalized -eq "xpathi") {
-        return [pscustomobject]@{ status = "covered-generic+static"; tools = "http_active_probe_scan, java_injection_semantic_scan"; next = "Expand XPath semantic rules for collections, sanitizers, and multi-method dataflow." }
+        return [pscustomobject]@{ status = "covered-generic-blackbox"; tools = "http_active_probe_scan"; next = "Add XPath-specific black-box payloads and response signals." }
     }
     if ($normalized -eq "crypto") {
-        return [pscustomobject]@{ status = "covered-static"; tools = "java_crypto_semantic_scan"; next = "Keep expanding crypto semantic rules for key/IV generation and authenticated encryption." }
+        return [pscustomobject]@{ status = "weak-blackbox-coverage"; tools = "runtime HTTP/browser evidence only"; next = "Add black-box crypto misuse signals where externally observable. Keep source semantic scans for assisted regression only." }
     }
     if ($normalized -eq "hash") {
-        return [pscustomobject]@{ status = "covered-static"; tools = "java_crypto_semantic_scan"; next = "Keep expanding hash semantic rules for password-hashing context and custom wrappers." }
+        return [pscustomobject]@{ status = "weak-blackbox-coverage"; tools = "runtime HTTP/browser evidence only"; next = "Add black-box hash misuse signals where externally observable. Keep source semantic scans for assisted regression only." }
     }
     if ($normalized -eq "weakrand") {
-        return [pscustomobject]@{ status = "covered-static+partial-runtime"; tools = "java_randomness_semantic_scan, weak_session_id_scan partial"; next = "Add generic runtime randomness sampling for reflected/body/header tokens and predictable seeding patterns." }
+        return [pscustomobject]@{ status = "partial-blackbox-coverage"; tools = "weak_session_id_scan partial"; next = "Add generic runtime randomness sampling for reflected/body/header tokens and predictable seeding patterns. Keep source semantic scans for assisted regression only." }
     }
     return [pscustomobject]@{ status = "unknown"; tools = "none"; next = "Inspect this category and map it to an existing tool or add a new one." }
 }
@@ -439,7 +477,7 @@ function New-ToolCoveragePlan {
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("# OWASP Benchmark Tool Coverage Plan")
     $lines.Add("")
-    $lines.Add("This plan is generated from the evaluated case set. It identifies whether the current SPA toolset can handle each sampled vulnerability category and what tool work remains.")
+    $lines.Add("This plan is generated from the evaluated case set. It identifies black-box tool coverage for each sampled vulnerability category and separates assisted source-regression work from scoring.")
     $lines.Add("")
     $lines.Add("| Category | Cases | Outcomes | Coverage | Current tools | Direct next work |")
     $lines.Add("| --- | ---: | --- | --- | --- | --- |")
@@ -459,11 +497,12 @@ function New-ToolCoveragePlan {
 
     $lines.Add("")
     $lines.Add("Execution order:")
-    $lines.Add("1. Use `http_active_probe_scan` for sampled path traversal, command injection, LDAP injection, and trust-boundary cases before asking for missing parameters.")
-    $lines.Add("2. Use `java_crypto_semantic_scan` for crypto/hash cases, `java_randomness_semantic_scan` for weakrand cases, and `java_injection_semantic_scan` for SQLi/LDAPI/XPathi/trustbound cases where runtime responses are collapsed or source-to-sink proof is needed.")
-    $lines.Add("3. Add runtime randomness sampling for reflected/body/header tokens before treating weakrand outside Java benchmark sources as fully covered.")
-    $lines.Add("4. Add XPath-specific active payloads/signals if source is unavailable for `xpathi`.")
-    $lines.Add("5. Re-run this scoring script and compare TP/FP/FN by category.")
+    $lines.Add("1. Use runtime HTTP/browser evidence only during black-box scoring. Do not inspect source, expected-result files, prior score files, generated reports, or benchmark metadata.")
+    $lines.Add("2. Use `database_risk_scan`, `xss_risk_scan`, `http_active_probe_scan`, `http_security_headers_scan`, and runtime session/token sampling where their required black-box inputs are available.")
+    $lines.Add("3. Add runtime randomness sampling for reflected/body/header tokens before treating weakrand as covered in black-box mode.")
+    $lines.Add("4. Add LDAP/XPath/trust-boundary-specific active payloads and state-delta checks that do not rely on source-to-sink proof.")
+    $lines.Add("5. Keep Java semantic tools for assisted regression/debugging only, and report those results separately from black-box scoring.")
+    $lines.Add("6. Re-run this scoring script and compare TP/FP/FN by category.")
 
     return ($lines -join [Environment]::NewLine)
 }
@@ -628,7 +667,7 @@ function Invoke-ParallelScoreRun {
         $stdoutPath = Join-Path $workersDir "$workerName.stdout.log"
         $stderrPath = Join-Path $workersDir "$workerName.stderr.log"
         New-Directory $workerDir
-        $workerCases | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $workerCasesPath -Encoding UTF8
+        ConvertTo-Json -InputObject @($workerCases) -Depth 12 | Set-Content -LiteralPath $workerCasesPath -Encoding UTF8
         $workerOutputDirs += $workerDir
 
         $args = @(
@@ -756,7 +795,7 @@ $codexEvalRoot = if ($CodexWorkDir) {
 } else {
     Join-Path $OutputDir "codex-workdir"
 }
-$cases = Read-BenchmarkCases
+$cases = @(Read-BenchmarkCases)
 if ($CaseIds -and $CaseIds.Count -gt 0) {
     $wantedCaseIds = [System.Collections.Generic.HashSet[string]]::new(
         [string[]]($CaseIds | ForEach-Object { "$_".Split(",") } | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
@@ -852,6 +891,14 @@ try {
                     -Prompt $prompt `
                     -ReportOutput $ReportOutput `
                     -MaxTokens $MaxTokens
+                if (Test-RetryableSpaFailure -Output $runResult.output -ExitCode $runResult.exit_code) {
+                    Write-Warning "Retrying SPA $id after retryable runner failure."
+                    $runResult = Invoke-SpaCase `
+                        -SpaCommand $spaCommand `
+                        -Prompt $prompt `
+                        -ReportOutput $ReportOutput `
+                        -MaxTokens $MaxTokens
+                }
             } elseif ($Runner -eq "codex") {
                 $caseWorkDir = Join-Path $codexEvalRoot $safeId
                 $runResult = Invoke-CodexCase `
@@ -866,6 +913,10 @@ try {
             }
             $output = @($runResult.output)
             $exitCode = $runResult.exit_code
+            if ($Runner -eq "spa" -and (Test-ProviderEmptySpaFailure -Output $output -ExitCode $exitCode)) {
+                $output += New-ProviderEmptyInconclusiveOutput -CaseId $id
+                $exitCode = 0
+            }
         }
         $endedAt = Get-Date
         $output | Set-Content -LiteralPath $logPath -Encoding UTF8

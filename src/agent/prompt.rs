@@ -52,6 +52,13 @@ mod tests {
     }
 
     #[test]
+    fn default_prompt_avoids_benchmark_specific_shortcuts() {
+        assert!(!DEFAULT_SYSTEM_PROMPT.to_lowercase().contains("benchmark"));
+        assert!(!DEFAULT_SYSTEM_PROMPT.contains("case ID"));
+        assert!(!DEFAULT_SYSTEM_PROMPT.contains("expected-results"));
+    }
+
+    #[test]
     fn default_prompt_defines_agent_identity() {
         assert!(DEFAULT_SYSTEM_PROMPT.contains("# Identity"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("Your product name is Safety Protection Agent"));
