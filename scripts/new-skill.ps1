@@ -13,6 +13,8 @@ param(
 
     [string]$Root,
 
+    [switch]$Private,
+
     [switch]$NoResources
 )
 
@@ -21,8 +23,21 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptDir
 
+if ($Private -and -not [string]::IsNullOrWhiteSpace($Root)) {
+    throw "Use either -Private or -Root, not both."
+}
+
 if ([string]::IsNullOrWhiteSpace($Root)) {
-    $Root = Join-Path $repoRoot "skills"
+    if ($Private -and -not [string]::IsNullOrWhiteSpace($env:SPA_PRIVATE_SKILLS_DIR)) {
+        if ([System.IO.Path]::IsPathRooted($env:SPA_PRIVATE_SKILLS_DIR)) {
+            $Root = $env:SPA_PRIVATE_SKILLS_DIR
+        } else {
+            $Root = Join-Path $repoRoot $env:SPA_PRIVATE_SKILLS_DIR
+        }
+    } else {
+        $RootName = if ($Private) { "private-skills" } else { "skills" }
+        $Root = Join-Path $repoRoot $RootName
+    }
 }
 
 if ($Name -notmatch '^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$') {

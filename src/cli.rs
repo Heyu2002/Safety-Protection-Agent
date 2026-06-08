@@ -34,6 +34,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
 
+const TRACKED_SKILLS_DIR: &str = "skills";
+const DEFAULT_PRIVATE_SKILLS_DIR: &str = "private-skills";
+const ENV_PRIVATE_SKILLS_DIR: &str = "SPA_PRIVATE_SKILLS_DIR";
 const COMPACT_MAX_TOKENS: u32 = 1200;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
 const DEFAULT_AUTO_COMPACT_PERCENT: usize = 90;
@@ -1242,6 +1245,11 @@ fn optional_env_usize_any(names: &[&'static str]) -> anyhow::Result<Option<usize
     Ok(None)
 }
 
+fn non_empty_path_from_os_string(value: std::ffi::OsString) -> Option<PathBuf> {
+    let value = value.to_string_lossy().trim().to_owned();
+    (!value.is_empty()).then_some(PathBuf::from(value))
+}
+
 fn combined_tool_specs(registry: &ToolRegistry, remote_mcp: &RemoteMcpToolbox) -> Vec<ToolSpec> {
     let mut tools = registry.specs();
     tools.extend(remote_mcp.specs());
@@ -1278,11 +1286,31 @@ async fn load_active_skill_context(
 }
 
 fn load_runtime_skills() -> anyhow::Result<Vec<RuntimeSkill>> {
-    let Some(root) = find_skills_root() else {
+    let Some(repo_root) = find_repo_root_with_skills() else {
         return Ok(Vec::new());
     };
-    let mut skills = Vec::new();
 
+    load_runtime_skills_from_roots(&runtime_skill_roots(&repo_root))
+}
+
+fn load_runtime_skills_from_roots(roots: &[PathBuf]) -> anyhow::Result<Vec<RuntimeSkill>> {
+    let mut skills_by_name = std::collections::BTreeMap::new();
+
+    for root in roots {
+        for skill in read_runtime_skills_from_root(root)? {
+            skills_by_name.insert(skill.name.clone(), skill);
+        }
+    }
+
+    Ok(skills_by_name.into_values().collect())
+}
+
+fn read_runtime_skills_from_root(root: &PathBuf) -> anyhow::Result<Vec<RuntimeSkill>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut skills = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -1303,12 +1331,37 @@ fn load_runtime_skills() -> anyhow::Result<Vec<RuntimeSkill>> {
     Ok(skills)
 }
 
-fn find_skills_root() -> Option<PathBuf> {
+fn runtime_skill_roots(repo_root: &PathBuf) -> Vec<PathBuf> {
+    vec![
+        repo_root.join(TRACKED_SKILLS_DIR),
+        private_skills_root(repo_root),
+    ]
+}
+
+fn private_skills_root(repo_root: &PathBuf) -> PathBuf {
+    private_skills_root_from_env()
+        .map(|path| resolve_runtime_path(repo_root, path))
+        .unwrap_or_else(|| repo_root.join(DEFAULT_PRIVATE_SKILLS_DIR))
+}
+
+fn private_skills_root_from_env() -> Option<PathBuf> {
+    std::env::var_os(ENV_PRIVATE_SKILLS_DIR).and_then(non_empty_path_from_os_string)
+}
+
+fn resolve_runtime_path(repo_root: &PathBuf, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
+}
+
+fn find_repo_root_with_skills() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        let candidate = dir.join("skills");
+        let candidate = dir.join(TRACKED_SKILLS_DIR);
         if candidate.is_dir() {
-            return Some(candidate);
+            return Some(dir);
         }
         if !dir.pop() {
             return None;
@@ -2613,6 +2666,22 @@ mod tests {
         }
     }
 
+    fn write_runtime_skill(
+        root: &std::path::Path,
+        name: &str,
+        description: &str,
+        body: &str,
+    ) -> PathBuf {
+        let skill_dir = root.join(name);
+        std::fs::create_dir_all(&skill_dir).expect("skill dir should be created");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"),
+        )
+        .expect("skill should write");
+        skill_dir
+    }
+
     struct FakeClient {
         request: Mutex<Option<CompletionRequest>>,
         response_content: String,
@@ -3013,6 +3082,63 @@ metadata:
             skill.description,
             "Use for website vulnerability discovery."
         );
+    }
+
+    #[test]
+    fn load_runtime_skills_reads_tracked_and_private_roots() {
+        let root = std::env::temp_dir().join(format!("spa-skills-test-{}", uuid::Uuid::new_v4()));
+        let tracked = root.join("skills");
+        let private = root.join("private-skills");
+        write_runtime_skill(
+            &tracked,
+            "public-skill",
+            "Use public skill.",
+            "Public body.",
+        );
+        write_runtime_skill(
+            &private,
+            "private-skill",
+            "Use private skill.",
+            "Private body.",
+        );
+
+        let skills = load_runtime_skills_from_roots(&[tracked, private])
+            .expect("skills should load from both roots");
+        let names = skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["private-skill", "public-skill"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn later_runtime_skill_roots_override_duplicate_names() {
+        let root = std::env::temp_dir().join(format!("spa-skills-test-{}", uuid::Uuid::new_v4()));
+        let tracked = root.join("skills");
+        let private = root.join("private-skills");
+        write_runtime_skill(
+            &tracked,
+            "duplicate-skill",
+            "Use tracked skill.",
+            "Tracked body.",
+        );
+        write_runtime_skill(
+            &private,
+            "duplicate-skill",
+            "Use private skill.",
+            "Private body.",
+        );
+
+        let skills = load_runtime_skills_from_roots(&[tracked, private])
+            .expect("skills should load from both roots");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "duplicate-skill");
+        assert_eq!(skills[0].description, "Use private skill.");
+        assert_eq!(skills[0].body, "Private body.");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

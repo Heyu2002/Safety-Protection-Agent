@@ -180,6 +180,11 @@ Runtime skills live in `skills/`. The host exposes the skill catalog to the
 model, the model selects relevant skills, and selected `SKILL.md` bodies are
 added to the agent context.
 
+Local private skills can live in `private-skills/`. That package is ignored by
+Git, loaded after `skills/`, and can override a built-in skill by using the same
+skill name. Set `SPA_PRIVATE_SKILLS_DIR` to use a different private skills
+directory.
+
 Included skills:
 
 - `web-vulnerability-discovery`
@@ -190,6 +195,12 @@ Create a new skill:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\new-skill.ps1 -Name skill-name -Description "Use when ..."
+```
+
+Create a local private skill that should not be committed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\new-skill.ps1 -Private -Name skill-name -Description "Use when ..."
 ```
 
 ## OWASP Benchmark Evaluation
@@ -254,6 +265,7 @@ src/tools/                 Built-in tools
 src/mcp_client.rs          MCP client integration
 src/agent/prompts/         System prompts
 skills/                    Runtime skills
+private-skills/            Local private runtime skills, ignored by Git
 scripts/                   Install, skill, and evaluation scripts
 target/                    Generated build and evaluation outputs
 ```

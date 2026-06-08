@@ -92,6 +92,8 @@ cargo run --bin spa-agent-lab-mcp
 
 运行时 skills 位于 `skills/`。Host 会把 skill catalog 暴露给模型，模型选择相关 skill 后，运行时再把对应的 `SKILL.md` 正文加入 agent 上下文。
 
+本地私有 skills 可以放在 `private-skills/`。该目录已被 Git 忽略，运行时会在加载 `skills/` 之后加载它；如果私有 skill 与内置 skill 同名，私有版本会覆盖内置版本。也可以通过 `SPA_PRIVATE_SKILLS_DIR` 指定其他私有 skills 目录。
+
 内置 skills：
 
 - `web-vulnerability-discovery`
@@ -102,6 +104,12 @@ cargo run --bin spa-agent-lab-mcp
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\new-skill.ps1 -Name skill-name -Description "Use when ..."
+```
+
+创建不会提交到 Git 的本地私有 skill：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\new-skill.ps1 -Private -Name skill-name -Description "Use when ..."
 ```
 
 ## 内置工具
@@ -166,6 +174,7 @@ src/tools/                 内置工具
 src/mcp_client.rs          MCP client 集成
 src/agent/prompts/         系统提示词
 skills/                    运行时 skills
+private-skills/            本地私有运行时 skills，已被 Git 忽略
 scripts/                   安装、skill 和评估脚本
 target/                    生成的构建和评估输出
 ```
